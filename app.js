@@ -5,24 +5,85 @@ function loadLibrary() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     const parsed = raw ? JSON.parse(raw) : [];
-    // Migrate from the old single-folder model (folderId) to multi-folder (folderIds),
-    // and backfill order/lastListened for albums saved before those existed.
-    return parsed.map((a, idx) => {
-      const migrated = a.folderIds ? a : { ...a, folderIds: a.folderId ? [a.folderId] : [] };
-      return {
-        ...migrated,
-        order: typeof migrated.order === "number" ? migrated.order : idx,
-        lastListened: migrated.lastListened || null,
-      };
-    });
+    return parsed.map(normalizeAlbum);
   } catch (e) {
     console.error("Failed to load library", e);
     return [];
   }
 }
 
+// Brings an album saved by any older version (or from an old backup file) up
+// to the current shape. Safe to run repeatedly.
+function normalizeAlbum(a, idx) {
+  // Old single-folder model (folderId) -> multi-folder (folderIds).
+  const migrated = a.folderIds ? { ...a } : { ...a, folderIds: a.folderId ? [a.folderId] : [] };
+  migrated.order = typeof migrated.order === "number" ? migrated.order : idx;
+  migrated.lastListened = migrated.lastListened || null;
+
+  // Ratings used to be whole stars where 0 meant "not rated". Now 0-5 in half
+  // steps is allowed (0 is a real rating) and null means "not rated".
+  if (migrated.ratingScale !== 2) {
+    migrated.rating = migrated.rating > 0 ? migrated.rating : null;
+    migrated.ratingScale = 2;
+  }
+  if (migrated.rating != null) migrated.rating = clampRating(migrated.rating);
+
+  // Genre used to be a single free-text field; now it's a list of tags.
+  // `genre` is kept as a comma-joined copy for anything that still reads it.
+  if (!Array.isArray(migrated.genres)) {
+    migrated.genres = splitTags(migrated.genre || "");
+  }
+  migrated.genre = migrated.genres.join(", ");
+  if (!Array.isArray(migrated.tags)) migrated.tags = [];
+  return migrated;
+}
+
 function saveLibrary() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(library));
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(library));
+  } catch (e) {
+    console.error("Failed to save library", e);
+    alert("Couldn't save your library (browser storage is full or blocked). Use Export to download a backup.");
+  }
+}
+
+// Ask the browser not to evict our data under storage pressure.
+if (navigator.storage && navigator.storage.persist) {
+  navigator.storage.persist().catch(() => {});
+}
+
+// ---------- Ratings (0-5 in half-star steps, null = not rated) ----------
+function clampRating(r) {
+  return Math.min(5, Math.max(0, Math.round(Number(r) * 2) / 2));
+}
+function isRated(a) {
+  return typeof a.rating === "number";
+}
+function formatRating(r) {
+  return typeof r === "number" ? `${r % 1 ? r.toFixed(1) : r}★` : "Not rated";
+}
+// Read-only star display that can show halves (CSS paints the filled part).
+function starsHtml(r, extraClass = "") {
+  const rated = typeof r === "number";
+  const pct = rated ? (r / 5) * 100 : 0;
+  const label = rated ? `${r} out of 5 stars` : "Not rated";
+  return `<span class="stars-display${rated ? "" : " unrated"} ${extraClass}" style="--pct:${pct}%" title="${label}" aria-label="${label}">★★★★★</span>`;
+}
+
+// ---------- Tags ----------
+const QUICK_TAGS = ["masterpiece", "great", "good", "ok", "meh", "bad", "overrated", "underrated", "grower", "relisten"];
+
+function splitTags(str) {
+  return (str || "")
+    .split(/[,/;]/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+function addUniqueTag(list, tag) {
+  const clean = (tag || "").trim().replace(/\s+/g, " ");
+  if (!clean) return list;
+  if (list.some((t) => t.toLowerCase() === clean.toLowerCase())) return list;
+  return [...list, clean];
 }
 
 // ---------- Folders ----------
@@ -138,8 +199,20 @@ const bulkSelectedCount = document.getElementById("bulkSelectedCount");
 const bulkFolderSelect = document.getElementById("bulkFolderSelect");
 const lastfmModal = document.getElementById("lastfmModal");
 const lastfmKeyInput = document.getElementById("lastfmKeyInput");
+const ratingValueEl = document.getElementById("ratingValue");
+const genreChipsEl = document.getElementById("genreChips");
+const tagChipsEl = document.getElementById("tagChips");
+const tagInput = document.getElementById("tagInput");
+const quickTagsEl = document.getElementById("quickTags");
+const tagFilterEl = document.getElementById("tagFilter");
+const formatInput = document.getElementById("formatInput");
+const recommendedByInput = document.getElementById("recommendedByInput");
+const firstListenedInput = document.getElementById("firstListenedInput");
+const trackSummaryEl = document.getElementById("trackSummary");
 
-let currentRating = 0;
+let currentRating = null;
+let currentGenres = [];
+let currentTags = [];
 let currentCoverUrl = "";
 let selectMode = false;
 let selectedIds = new Set();
@@ -148,7 +221,9 @@ let selectedIds = new Set();
 function renderLibrary() {
   updateActiveFilterChip();
 
+  const tagFilter = tagFilterEl.value;
   const folderScoped = library.filter((a) => {
+    if (tagFilter && !albumHasTag(a, tagFilter)) return false;
     if (currentFolderFilter === "all") return true;
     if (currentFolderFilter === "unsorted") return (a.folderIds || []).length === 0;
     return (a.folderIds || []).includes(currentFolderFilter);
@@ -168,15 +243,14 @@ function renderLibrary() {
 
   let items = folderScoped.filter((a) => {
     if (!query) return true;
-    return (
-      a.title.toLowerCase().includes(query) ||
-      a.artist.toLowerCase().includes(query) ||
-      (a.genre || "").toLowerCase().includes(query)
-    );
+    return [a.title, a.artist, ...(a.genres || []), ...(a.tags || []), a.recommendedBy]
+      .some((field) => (field || "").toLowerCase().includes(query));
   });
 
   const [sortKey, sortDir] = sortSelect.value.split("-");
   items.sort((a, b) => {
+    // Unrated albums always go to the bottom, whichever direction you sort ratings.
+    if (sortKey === "rating" && isRated(a) !== isRated(b)) return isRated(a) ? -1 : 1;
     let va = a[sortKey];
     let vb = b[sortKey];
     if (sortKey === "title" || sortKey === "artist") {
@@ -227,7 +301,11 @@ function renderAlbumCards(items) {
       ? `<img src="${escapeAttr(album.coverUrl)}" alt="${escapeAttr(album.title)}">`
       : `<div class="no-cover">🎵</div>`;
 
-    const stars = "★".repeat(album.rating) + "☆".repeat(5 - album.rating);
+    const favTrack = (album.tracklist || []).find((t) => t.favorite);
+    const chipsHtml = [
+      ...(album.genres || []).map((g) => `<span class="chip genre">${escapeHtml(g)}</span>`),
+      ...(album.tags || []).map((t) => `<span class="chip">${escapeHtml(t)}</span>`),
+    ].join("");
     const folderObjs = currentFolderFilter === "all" ? (album.folderIds || []).map((id) => folders.find((f) => f.id === id)).filter(Boolean) : [];
     const folderTagsHtml = folderObjs.length
       ? `<div class="folder-tags">${folderObjs
@@ -255,9 +333,11 @@ function renderAlbumCards(items) {
         <div class="album-card-title">${escapeHtml(album.title)}</div>
         <div class="album-card-artist">${escapeHtml(album.artist)}</div>
         <div class="album-card-meta">
-          <span class="mini-stars">${stars}</span>
+          ${starsHtml(album.rating, "mini-stars")}
           <span>▶ ${album.timesListened || 0}</span>
         </div>
+        ${favTrack ? `<div class="card-fav" title="Favorite track">♥ ${escapeHtml(favTrack.name)}</div>` : ""}
+        ${chipsHtml ? `<div class="card-chips">${chipsHtml}</div>` : ""}
         ${folderTagsHtml}
       </div>
     `;
@@ -375,7 +455,7 @@ function renderArtistCards(albums, query) {
 
   artistList.forEach((entry) => {
     const cover = entry.albums.find((a) => a.coverUrl)?.coverUrl;
-    const ratedAlbums = entry.albums.filter((a) => a.rating > 0);
+    const ratedAlbums = entry.albums.filter(isRated);
     const avgRating = ratedAlbums.length
       ? (ratedAlbums.reduce((s, a) => s + a.rating, 0) / ratedAlbums.length).toFixed(1)
       : null;
@@ -432,23 +512,207 @@ function escapeAttr(str) {
   return escapeHtml(str).replace(/"/g, "&quot;");
 }
 
-// ---------- Star rating widget ----------
+// ---------- Star rating widget (half stars) ----------
+// Each star has an invisible left and right half: clicking the left half of
+// star 3 gives 2.5, the right half gives 3. Clicking the current value again
+// clears it. Arrow keys step by half a star.
+function paintStars(value) {
+  const v = typeof value === "number" ? value : 0;
+  ratingStarsEl.querySelectorAll(".hs-star").forEach((star, i) => {
+    const fill = Math.max(0, Math.min(1, v - i));
+    star.querySelector(".hs-fill").style.width = fill * 100 + "%";
+  });
+}
+
+function setRating(value) {
+  currentRating = value == null ? null : clampRating(value);
+  renderStars();
+}
+
 function renderStars() {
-  ratingStarsEl.innerHTML = "";
-  for (let i = 1; i <= 5; i++) {
-    const span = document.createElement("span");
-    span.textContent = i <= currentRating ? "★" : "☆";
-    span.className = i <= currentRating ? "filled" : "";
-    span.addEventListener("click", () => {
-      currentRating = i === currentRating ? 0 : i;
-      renderStars();
+  if (!ratingStarsEl.dataset.built) {
+    ratingStarsEl.dataset.built = "1";
+    for (let i = 1; i <= 5; i++) {
+      const star = document.createElement("span");
+      star.className = "hs-star";
+      star.innerHTML = `☆<span class="hs-fill">★</span><span class="hs-half left"></span><span class="hs-half right"></span>`;
+      [[".left", i - 0.5], [".right", i]].forEach(([sel, val]) => {
+        const half = star.querySelector(".hs-half" + sel);
+        half.title = `${val} star${val === 1 ? "" : "s"}`;
+        half.addEventListener("mouseenter", () => {
+          paintStars(val);
+          ratingValueEl.textContent = formatRating(val);
+        });
+        half.addEventListener("click", (e) => {
+          e.preventDefault();
+          setRating(currentRating === val ? null : val);
+        });
+      });
+      ratingStarsEl.appendChild(star);
+    }
+    ratingStarsEl.addEventListener("mouseleave", renderStars);
+    ratingStarsEl.addEventListener("keydown", (e) => {
+      const cur = typeof currentRating === "number" ? currentRating : 0;
+      if (e.key === "ArrowRight" || e.key === "ArrowUp") setRating(Math.min(5, cur + 0.5));
+      else if (e.key === "ArrowLeft" || e.key === "ArrowDown") setRating(Math.max(0, cur - 0.5));
+      else if (e.key === "Home") setRating(0);
+      else if (e.key === "End") setRating(5);
+      else if (e.key === "Delete" || e.key === "Backspace") setRating(null);
+      else return;
+      e.preventDefault();
     });
-    ratingStarsEl.appendChild(span);
   }
+  paintStars(currentRating);
+  ratingValueEl.textContent = typeof currentRating === "number" ? `${formatRating(currentRating)} / 5` : "Not rated";
+  ratingStarsEl.setAttribute("aria-valuenow", typeof currentRating === "number" ? currentRating : 0);
+  ratingStarsEl.setAttribute("aria-valuetext", formatRating(currentRating));
+}
+
+document.getElementById("ratingZeroBtn").addEventListener("click", () => setRating(0));
+document.getElementById("ratingClearBtn").addEventListener("click", () => setRating(null));
+
+// ---------- Genre + tag chip inputs ----------
+function allUsedTags(field) {
+  const counts = new Map();
+  library.forEach((a) =>
+    (a[field] || []).forEach((t) => {
+      const key = t.toLowerCase();
+      const entry = counts.get(key) || { name: t, count: 0 };
+      entry.count++;
+      counts.set(key, entry);
+    })
+  );
+  return [...counts.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+}
+
+function albumHasTag(album, filterValue) {
+  const sep = filterValue.indexOf(":");
+  const kind = filterValue.slice(0, sep);
+  const name = filterValue.slice(sep + 1);
+  const list = kind === "genre" ? album.genres : album.tags;
+  return (list || []).some((t) => t.toLowerCase() === name);
+}
+
+function renderChips(container, input, list, className, onRemove) {
+  container.querySelectorAll(".chip").forEach((c) => c.remove());
+  list.forEach((tag, idx) => {
+    const chip = document.createElement("span");
+    chip.className = "chip " + className;
+    chip.textContent = tag;
+    const x = document.createElement("button");
+    x.type = "button";
+    x.textContent = "✕";
+    x.title = `Remove "${tag}"`;
+    x.addEventListener("click", () => onRemove(idx));
+    chip.appendChild(x);
+    container.insertBefore(chip, input);
+  });
+}
+
+function renderGenreChips() {
+  renderChips(genreChipsEl, genreInput, currentGenres, "genre", (idx) => {
+    currentGenres.splice(idx, 1);
+    renderGenreChips();
+  });
+}
+
+function renderTagChips() {
+  // Quick-pick tags show as toggles; anything else shows as a removable chip.
+  const quickLower = QUICK_TAGS.map((t) => t.toLowerCase());
+  quickTagsEl.innerHTML = "";
+  QUICK_TAGS.forEach((tag) => {
+    const on = currentTags.some((t) => t.toLowerCase() === tag);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "quick-tag" + (on ? " on" : "");
+    btn.textContent = tag;
+    btn.addEventListener("click", () => {
+      currentTags = on ? currentTags.filter((t) => t.toLowerCase() !== tag) : addUniqueTag(currentTags, tag);
+      renderTagChips();
+    });
+    quickTagsEl.appendChild(btn);
+  });
+  const custom = currentTags.filter((t) => !quickLower.includes(t.toLowerCase()));
+  renderChips(tagChipsEl, tagInput, custom, "", (idx) => {
+    const removed = custom[idx];
+    currentTags = currentTags.filter((t) => t !== removed);
+    renderTagChips();
+  });
+}
+
+function commitChipInput(input, kind) {
+  const parts = splitTags(input.value);
+  if (!parts.length) return false;
+  parts.forEach((p) => {
+    if (kind === "genre") currentGenres = addUniqueTag(currentGenres, p);
+    else currentTags = addUniqueTag(currentTags, p);
+  });
+  input.value = "";
+  kind === "genre" ? renderGenreChips() : renderTagChips();
+  return true;
+}
+
+[[genreInput, "genre"], [tagInput, "tag"]].forEach(([input, kind]) => {
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === ",") {
+      e.preventDefault();
+      commitChipInput(input, kind);
+    } else if (e.key === "Backspace" && !input.value) {
+      if (kind === "genre" && currentGenres.length) {
+        currentGenres.pop();
+        renderGenreChips();
+      } else if (kind === "tag" && currentTags.length) {
+        currentTags.pop();
+        renderTagChips();
+      }
+    }
+  });
+  // Picking from the suggestion dropdown fires "input" with the full value.
+  input.addEventListener("change", () => commitChipInput(input, kind));
+  input.addEventListener("blur", () => commitChipInput(input, kind));
+});
+
+function refreshTagSuggestions() {
+  document.getElementById("genreSuggestions").innerHTML = allUsedTags("genres")
+    .map((t) => `<option value="${escapeAttr(t.name)}">`)
+    .join("");
+  document.getElementById("tagSuggestions").innerHTML = allUsedTags("tags")
+    .filter((t) => !QUICK_TAGS.includes(t.name.toLowerCase()))
+    .map((t) => `<option value="${escapeAttr(t.name)}">`)
+    .join("");
+}
+
+function renderTagFilterOptions() {
+  const prev = tagFilterEl.value;
+  const genres = allUsedTags("genres");
+  const tags = allUsedTags("tags");
+  tagFilterEl.innerHTML =
+    `<option value="">All genres &amp; tags</option>` +
+    (genres.length
+      ? `<optgroup label="Genres">${genres
+          .map((g) => `<option value="genre:${escapeAttr(g.name.toLowerCase())}">${escapeHtml(g.name)} (${g.count})</option>`)
+          .join("")}</optgroup>`
+      : "") +
+    (tags.length
+      ? `<optgroup label="Tags">${tags
+          .map((t) => `<option value="tag:${escapeAttr(t.name.toLowerCase())}">${escapeHtml(t.name)} (${t.count})</option>`)
+          .join("")}</optgroup>`
+      : "");
+  tagFilterEl.value = [...tagFilterEl.options].some((o) => o.value === prev) ? prev : "";
 }
 
 // ---------- Track list rendering ----------
+function renderTrackSummary() {
+  const favs = currentTracks.filter((t) => t.favorite);
+  const least = currentTracks.filter((t) => t.least);
+  const list = (items) => `<ul>${items.map((t) => `<li>${escapeHtml(t.name)}</li>`).join("")}</ul>`;
+  trackSummaryEl.innerHTML =
+    (favs.length ? `<div><h4>♥ Favorite tracks</h4>${list(favs)}</div>` : "") +
+    (least.length ? `<div><h4>👎 Least favorite tracks</h4>${list(least)}</div>` : "");
+}
+
 function renderTrackList() {
+  renderTrackSummary();
   trackListEl.innerHTML = "";
   if (currentTracks.length === 0) {
     trackListEl.innerHTML = `<li style="color:var(--text-dim); justify-content:center;">No tracks yet</li>`;
@@ -527,10 +791,16 @@ function openModal(id) {
   artistInput.value = album?.artist || "";
   titleInput.value = album?.title || "";
   yearInput.value = album?.year || "";
-  genreInput.value = album?.genre || "";
+  genreInput.value = "";
+  tagInput.value = "";
+  currentGenres = [...(album?.genres || [])];
+  currentTags = [...(album?.tags || [])];
+  formatInput.value = album?.format || "";
+  recommendedByInput.value = album?.recommendedBy || "";
+  firstListenedInput.value = album?.firstListened || (album ? "" : new Date().toISOString().slice(0, 10));
   notesInput.value = album?.notes || "";
   timesListenedInput.value = album?.timesListened || 0;
-  currentRating = album?.rating || 0;
+  currentRating = album && isRated(album) ? album.rating : null;
   currentCoverUrl = album?.coverUrl || "";
   currentTracks = album ? JSON.parse(JSON.stringify(album.tracklist || [])) : [];
   autofillStatus.textContent = "";
@@ -544,6 +814,9 @@ function openModal(id) {
 
   updateCoverPreview();
   renderStars();
+  renderGenreChips();
+  renderTagChips();
+  refreshTagSuggestions();
   renderTrackList();
   renderRatingHistory(album);
 
@@ -553,6 +826,8 @@ function openModal(id) {
 function closeModal() {
   modal.hidden = true;
   editingId = null;
+  searchSeq++; // drop any search still in flight for this form
+  clearTimeout(autoSearchTimer);
 }
 
 function updateCoverPreview() {
@@ -586,10 +861,9 @@ function renderRatingHistory(album) {
       month: "short",
       day: "numeric",
     });
-    const stars = "★".repeat(entry.rating) + "☆".repeat(5 - entry.rating);
     li.innerHTML = `
       <span class="rh-date">${escapeHtml(dateStr)}</span>
-      <span class="rh-stars">${stars}</span>
+      <span class="rh-stars">${starsHtml(entry.rating)} ${typeof entry.rating === "number" ? formatRating(entry.rating) : ""}</span>
       <span class="rh-listens">▶ ${entry.timesListened}</span>
     `;
     ratingHistoryListEl.appendChild(li);
@@ -620,6 +894,10 @@ document.getElementById("saveAlbumBtn").addEventListener("click", () => {
     return;
   }
 
+  // Anything still typed in the tag boxes counts, even without pressing Enter.
+  commitChipInput(genreInput, "genre");
+  commitChipInput(tagInput, "tag");
+
   const prevAlbum = editingId ? library.find((a) => a.id === editingId) : null;
   const prevHistory = prevAlbum?.ratingHistory || [];
   const newRating = currentRating;
@@ -638,10 +916,16 @@ document.getElementById("saveAlbumBtn").addEventListener("click", () => {
     artist,
     title,
     year: yearInput.value.trim(),
-    genre: genreInput.value.trim(),
+    genres: currentGenres,
+    genre: currentGenres.join(", "),
+    tags: currentTags,
+    format: formatInput.value,
+    recommendedBy: recommendedByInput.value.trim(),
+    firstListened: firstListenedInput.value || null,
     notes: notesInput.value,
     timesListened: newListens,
     rating: currentRating,
+    ratingScale: 2,
     coverUrl: currentCoverUrl,
     tracklist: currentTracks,
     folderIds: getSelectedFolderIds(),
@@ -661,6 +945,7 @@ document.getElementById("saveAlbumBtn").addEventListener("click", () => {
   }
 
   saveLibrary();
+  renderTagFilterOptions();
   renderLibrary();
   closeModal();
 });
@@ -670,6 +955,7 @@ deleteAlbumBtn.addEventListener("click", () => {
   if (!confirm("Delete this album from your library? This can't be undone.")) return;
   library = library.filter((a) => a.id !== editingId);
   saveLibrary();
+  renderTagFilterOptions();
   renderLibrary();
   closeModal();
 });
@@ -905,16 +1191,13 @@ document.getElementById("bulkDeleteBtn").addEventListener("click", () => {
   library = library.filter((a) => !selectedIds.has(a.id));
   selectedIds.clear();
   saveLibrary();
+  renderTagFilterOptions();
   updateBulkBar();
   renderLibrary();
 });
 
 // ---------- Auto-fill: search iTunes + MusicBrainz, let the user pick ----------
 document.getElementById("autofillBtn").addEventListener("click", autofillSearch);
-
-function normalizeKey(artist, title) {
-  return `${(artist || "").trim().toLowerCase()}|${(title || "").trim().toLowerCase()}`;
-}
 
 function levenshtein(a, b) {
   const m = a.length,
@@ -938,19 +1221,94 @@ function textSimilarity(a, b) {
   return 1 - levenshtein(a, b) / Math.max(a.length, b.length);
 }
 
-// How well a candidate actually matches what was typed — title carries more
-// weight since it's usually the more specific identifier. This is what
-// determines list order, so the right album doesn't get buried under noise
-// just because it came from whichever source's search ran second.
-function scoreCandidate(candidate, queryArtist, queryTitle) {
-  const titleSim = textSimilarity(candidate.title, queryTitle);
-  const artistSim = queryArtist ? textSimilarity(candidate.artist, queryArtist) : 0.5;
-  return titleSim * 0.65 + artistSim * 0.35;
+// ---------- Candidate ranking ----------
+// Lowercase, strip accents and punctuation, "&" -> "and", so "Sgt. Pepper's"
+// and "sgt peppers" compare as equal.
+function normText(s) {
+  return (s || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/['’`]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+const EDITION_WORDS = /deluxe|remaster|edition|expanded|anniversary|bonus|version|reissue|explicit|clean|mono|stereo|special|collector|super/i;
+// Title with "(Deluxe Edition)", "[2011 Remaster]", " - Single" etc removed,
+// so the plain album name is what gets compared against the query.
+function baseTitle(title) {
+  return (title || "")
+    .replace(/\s*[\(\[]([^\)\]]*)[\)\]]/g, (m, inner) => (EDITION_WORDS.test(inner) ? "" : m))
+    .replace(/\s+-\s+(single|ep)\s*$/i, "")
+    .trim();
+}
+
+const JUNK_RE = /karaoke|tribute|made famous|in the style of|lullaby|8[- ]?bit|piano versions?|string quartet|cover versions?|as performed by|instrumental versions/i;
+const LIVE_COMP_RE = /\blive\b|greatest hits|best of|anthology|collection|remix(es)?|essentials|b-sides/i;
+
+function tokens(s) {
+  return normText(s).split(" ").filter(Boolean);
+}
+
+// How well a candidate matches what was typed, 0..~1.1. This decides list
+// order, so the album you meant should land at the top instead of somewhere
+// under deluxe reissues, singles and karaoke knock-offs.
+function scoreCandidate(c, queryArtist, queryTitle) {
+  const qTitle = normText(queryTitle);
+  const qArtist = normText(queryArtist);
+  const qAll = `${qArtist} ${qTitle}`.trim();
+  const cTitle = normText(baseTitle(c.title));
+  const cArtist = normText(c.artist);
+
+  // 1. Direct field-by-field similarity.
+  let match = 0;
+  if (qTitle) {
+    const titleSim = Math.max(textSimilarity(cTitle, qTitle), textSimilarity(normText(c.title), qTitle));
+    match = qArtist ? titleSim * 0.6 + textSimilarity(cArtist, qArtist) * 0.4 : titleSim;
+  } else if (qArtist) {
+    match = textSimilarity(cArtist, qArtist);
+  }
+
+  // 2. Word overlap, which catches "radiohead ok computer" typed into one box,
+  // or words typed in a different order. Also checks the album title isn't
+  // much longer than what was typed.
+  const qTok = tokens(qAll);
+  const cTok = new Set([...tokens(cTitle), ...tokens(cArtist)]);
+  const titleTok = tokens(cTitle);
+  if (qTok.length && titleTok.length) {
+    const coverage = qTok.filter((t) => cTok.has(t)).length / qTok.length;
+    const titleCovered = titleTok.filter((t) => qTok.includes(t)).length / titleTok.length;
+    match = Math.max(match, (coverage * 0.6 + titleCovered * 0.4) * 0.97);
+  }
+
+  // 3. Penalties for things that are rarely what you're looking for, unless
+  // you actually typed that word (e.g. searching "live at leeds").
+  const rawTitle = c.title || "";
+  const typed = (re) => re.test(qAll);
+  let penalty = 0;
+  if (JUNK_RE.test(rawTitle) || JUNK_RE.test(c.artist || "")) penalty += 0.4;
+  if (c.kind === "Single" || c.kind === "EP") penalty += 0.15;
+  if ((c.kind === "Live" || c.kind === "Compilation" || LIVE_COMP_RE.test(rawTitle)) && !typed(LIVE_COMP_RE)) penalty += 0.1;
+  if (EDITION_WORDS.test(rawTitle.replace(baseTitle(rawTitle), "")) && !typed(EDITION_WORDS)) penalty += 0.04;
+  if (c.trackCount && c.trackCount <= 3) penalty += 0.08;
+
+  // 4. Small nudges for signals of "the well-known release": the source's
+  // own relevance/popularity order, and both sources agreeing it exists.
+  const bonus = (1 - (c.rank ?? 1)) * 0.08 + (c.sources && c.sources.size > 1 ? 0.06 : 0);
+
+  return match - penalty + bonus;
+}
+
+function rankCandidates(candidates, queryArtist, queryTitle) {
+  candidates.forEach((c) => (c.score = scoreCandidate(c, queryArtist, queryTitle)));
+  return candidates.sort((a, b) => b.score - a.score);
 }
 
 async function searchItunes(artist, title) {
   const term = encodeURIComponent(`${artist} ${title}`.trim());
-  const data = await jsonp(`https://itunes.apple.com/search?term=${term}&entity=album&limit=8`);
+  const data = await jsonp(`https://itunes.apple.com/search?term=${term}&entity=album&media=music&limit=25`);
   return data.results || [];
 }
 
@@ -1080,48 +1438,106 @@ async function searchMusicBrainzByArtist(artist) {
   return groups;
 }
 
+// Candidates are deduped on exact (normalized) artist+title. Separately, a
+// looser key that ignores "(Deluxe Edition)" etc records when BOTH sources
+// know about the same album, which is a strong sign it's the real one.
+function recordAgreement(candidates, source, artist, title) {
+  const loose = normText(artist) + "|" + normText(baseTitle(title));
+  candidates.forEach((c) => {
+    if (normText(c.artist) + "|" + normText(baseTitle(c.title)) === loose) c.sources.add(source);
+  });
+}
+
+function pushCandidate(candidates, seenKeys, c) {
+  const key = normText(c.artist) + "|" + normText(c.title);
+  if (!c.title || seenKeys.has(key)) return;
+  seenKeys.add(key);
+  c.sources = new Set([c.source]);
+  candidates.push(c);
+}
+
 function addItunesCandidates(results, candidates, seenKeys) {
-  results.forEach((r) => {
-    const key = normalizeKey(r.artistName, r.collectionName);
-    if (!r.collectionName || seenKeys.has(key)) return;
-    seenKeys.add(key);
-    candidates.push({
+  results.forEach((r, i) => {
+    if (!r.collectionName) return;
+    recordAgreement(candidates, "itunes", r.artistName, r.collectionName);
+    const kindMatch = /\s-\s(single|ep)\s*$/i.exec(r.collectionName);
+    pushCandidate(candidates, seenKeys, {
       source: "itunes",
       title: r.collectionName,
       artist: r.artistName,
       year: r.releaseDate ? new Date(r.releaseDate).getFullYear() : "",
       genre: r.primaryGenreName || "",
       coverUrl: r.artworkUrl100 ? r.artworkUrl100.replace("100x100bb", "600x600bb") : "",
+      trackCount: r.trackCount || 0,
+      kind: kindMatch ? (kindMatch[1].toLowerCase() === "ep" ? "EP" : "Single") : "Album",
+      rank: results.length > 1 ? i / (results.length - 1) : 0,
       raw: r,
     });
   });
 }
 
 function addMusicBrainzCandidates(results, candidates, seenKeys) {
-  results.forEach((rg) => {
-    const artistName = (rg["artist-credit"] || []).map((c) => c.name).join(" ");
-    const key = normalizeKey(artistName, rg.title);
-    if (!rg.title || seenKeys.has(key)) return;
-    seenKeys.add(key);
-    candidates.push({
+  results.forEach((rg, i) => {
+    const artistName = (rg["artist-credit"] || []).map((c) => c.name + (c.joinphrase || "")).join("").trim();
+    if (!rg.title) return;
+    recordAgreement(candidates, "musicbrainz", artistName, rg.title);
+    const secondary = rg["secondary-types"] || [];
+    pushCandidate(candidates, seenKeys, {
       source: "musicbrainz",
       title: rg.title,
       artist: artistName,
       year: rg["first-release-date"] ? rg["first-release-date"].slice(0, 4) : "",
       genre: "",
       coverUrl: `https://coverartarchive.org/release-group/${rg.id}/front-500`,
+      kind: secondary.includes("Live") ? "Live" : secondary.includes("Compilation") ? "Compilation" : rg["primary-type"] || "Album",
+      rank: results.length > 1 ? i / (results.length - 1) : 0,
       raw: rg.id,
     });
   });
 }
 
+// ---------- Search-as-you-type ----------
+let searchSeq = 0; // bumps on every search so stale results are ignored
+let autoSearchTimer = null;
+let lastSearchKey = "";
+
+function scheduleAutoSearch() {
+  clearTimeout(autoSearchTimer);
+  const artist = artistInput.value.trim();
+  const title = titleInput.value.trim();
+  // Only once there's enough to search on, and not for the same text twice.
+  if (title.length < 3 && !(artist.length >= 3 && !title)) return;
+  autoSearchTimer = setTimeout(() => {
+    if (normText(artist) + "|" + normText(title) === lastSearchKey) return;
+    autofillSearch();
+  }, 800);
+}
+
+[artistInput, titleInput].forEach((input) => {
+  input.addEventListener("input", scheduleAutoSearch);
+  input.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    clearTimeout(autoSearchTimer);
+    // Enter with results already showing picks the top one; otherwise search.
+    const top = candidateListEl.querySelector(".candidate-item");
+    const key = normText(artistInput.value.trim()) + "|" + normText(titleInput.value.trim());
+    if (top && key === lastSearchKey) top.click();
+    else autofillSearch();
+  });
+});
+
 async function autofillSearch() {
+  clearTimeout(autoSearchTimer);
   const artist = artistInput.value.trim();
   const title = titleInput.value.trim();
   if (!artist && !title) {
     autofillStatus.textContent = "Enter an artist or album title first.";
     return;
   }
+  const seq = ++searchSeq;
+  const isStale = () => seq !== searchSeq;
+  lastSearchKey = normText(artist) + "|" + normText(title);
 
   candidateListEl.innerHTML = "";
 
@@ -1134,6 +1550,7 @@ async function autofillSearch() {
       searchItunes(artist, ""),
       searchMusicBrainzByArtist(artist),
     ]);
+    if (isStale()) return;
 
     const candidates = [];
     const seenKeys = new Set();
@@ -1145,7 +1562,11 @@ async function autofillSearch() {
       return;
     }
 
-    candidates.sort((a, b) => (parseInt(a.year) || 9999) - (parseInt(b.year) || 9999));
+    // The artist's own full albums first (oldest to newest), then anything by
+    // other artists, singles/EPs, live sets and knock-offs.
+    candidates.forEach((c) => (c.score = scoreCandidate(c, artist, "")));
+    const tier = (c) => (c.score < 0.75 ? 2 : c.kind === "Album" && !JUNK_RE.test(c.title) ? 0 : 1);
+    candidates.sort((a, b) => tier(a) - tier(b) || (parseInt(a.year) || 9999) - (parseInt(b.year) || 9999));
     autofillStatus.textContent = `Found ${candidates.length} album${candidates.length === 1 ? "" : "s"} by ${artist} — pick one:`;
     renderCandidates(candidates);
     return;
@@ -1161,6 +1582,7 @@ async function autofillSearch() {
   }
 
   const [itunesResult, mbResult, itunesTitleOnly, mbTitleOnly] = await Promise.allSettled(searches);
+  if (isStale()) return;
 
   const candidates = [];
   const seenKeys = new Set();
@@ -1179,17 +1601,18 @@ async function autofillSearch() {
   // Rank by how closely each candidate actually matches what was typed, not
   // by which source's search happened to run first — otherwise the right
   // album can end up buried under less-relevant results from the other source.
-  candidates.sort((a, b) => scoreCandidate(b, artist, title) - scoreCandidate(a, artist, title));
+  rankCandidates(candidates, artist, title);
 
-  autofillStatus.textContent = `Found ${candidates.length} possible match${candidates.length === 1 ? "" : "es"} — pick the right one:`;
-  renderCandidates(candidates);
+  autofillStatus.textContent = `Found ${candidates.length} possible match${candidates.length === 1 ? "" : "es"} — best match first (Enter picks it):`;
+  renderCandidates(candidates.slice(0, 20), true);
 }
 
-function renderCandidates(candidates) {
+function renderCandidates(candidates, markBest) {
   candidateListEl.innerHTML = "";
-  candidates.forEach((c) => {
+  candidates.forEach((c, idx) => {
     const row = document.createElement("div");
-    row.className = "candidate-item";
+    const isBest = markBest && idx === 0;
+    row.className = "candidate-item" + (isBest ? " best" : "");
 
     const thumb = document.createElement("img");
     thumb.className = "candidate-thumb";
@@ -1202,13 +1625,17 @@ function renderCandidates(candidates) {
     const info = document.createElement("div");
     info.className = "candidate-info";
     info.innerHTML = `
-      <div class="candidate-title">${escapeHtml(c.title)}</div>
-      <div class="candidate-meta">${escapeHtml(c.artist)}${c.year ? " · " + escapeHtml(String(c.year)) : ""}</div>
+      <div class="candidate-title">${escapeHtml(c.title)}${isBest ? `<span class="best-badge">Best match</span>` : ""}</div>
+      <div class="candidate-meta">${escapeHtml(c.artist)}${c.year ? " · " + escapeHtml(String(c.year)) : ""}${
+        c.trackCount ? ` · ${c.trackCount} tracks` : ""
+      }${c.kind && c.kind !== "Album" ? `<span class="candidate-kind">${escapeHtml(c.kind)}</span>` : ""}${
+        findExistingAlbum(c.artist, c.title) ? ` · <strong>already in your library</strong>` : ""
+      }</div>
     `;
 
     const sourceTag = document.createElement("span");
     sourceTag.className = "candidate-source";
-    sourceTag.textContent = c.source === "itunes" ? "iTunes" : "MusicBrainz";
+    sourceTag.textContent = [...(c.sources || [c.source])].map((s) => (s === "itunes" ? "iTunes" : "MusicBrainz")).join(" + ");
 
     row.appendChild(thumb);
     row.appendChild(info);
@@ -1218,12 +1645,29 @@ function renderCandidates(candidates) {
   });
 }
 
+function findExistingAlbum(artist, title) {
+  const key = normText(artist) + "|" + normText(baseTitle(title));
+  return library.find((a) => a.id !== editingId && normText(a.artist) + "|" + normText(baseTitle(a.title)) === key);
+}
+
 async function selectCandidate(candidate) {
+  const existing = findExistingAlbum(candidate.artist, candidate.title);
+  if (existing && confirm(`"${existing.title}" is already in your library. Open that entry instead of adding a duplicate?`)) {
+    openModal(existing.id);
+    return;
+  }
+  const seq = ++searchSeq;
+  clearTimeout(autoSearchTimer);
   candidateListEl.innerHTML = "";
   artistInput.value = candidate.artist;
   titleInput.value = candidate.title;
+  lastSearchKey = normText(candidate.artist) + "|" + normText(candidate.title);
+  updateSpotifyLink();
   if (candidate.year) yearInput.value = candidate.year;
-  if (candidate.genre) genreInput.value = candidate.genre;
+  if (candidate.genre && currentGenres.length === 0) {
+    splitTags(candidate.genre).forEach((g) => (currentGenres = addUniqueTag(currentGenres, g)));
+    renderGenreChips();
+  }
   currentCoverUrl = candidate.coverUrl || "";
   coverPlaceholder.textContent = "No cover yet";
   updateCoverPreview();
@@ -1238,6 +1682,7 @@ async function selectCandidate(candidate) {
       fetchTracklistForCandidate(candidate),
       fetchTracklistFallback(candidate),
     ]);
+    if (seq !== searchSeq) return; // user picked something else / closed the form meanwhile
     const primaryTracks = primaryResult.status === "fulfilled" ? primaryResult.value : [];
     const otherTracks = otherResult.status === "fulfilled" ? otherResult.value : [];
     const otherSourceName = candidate.source === "itunes" ? "MusicBrainz" : "iTunes";
@@ -1287,8 +1732,17 @@ importFileInput.addEventListener("change", () => {
       const merge = confirm(
         "Click OK to merge this backup into your current library, or Cancel to replace your current library entirely."
       );
-      library = merge ? library.concat(data) : data;
+      const incoming = data.map(normalizeAlbum);
+      if (merge) {
+        // Same album id in both = the backup's copy wins, instead of a duplicate.
+        const byId = new Map(library.map((a) => [a.id, a]));
+        incoming.forEach((a) => byId.set(a.id, a));
+        library = [...byId.values()];
+      } else {
+        library = incoming;
+      }
       saveLibrary();
+      renderTagFilterOptions();
       renderLibrary();
       alert("Import complete.");
     } catch (e) {
@@ -1304,7 +1758,7 @@ importFileInput.addEventListener("change", () => {
 function computeStats() {
   const totalAlbums = library.length;
   const totalListens = library.reduce((sum, a) => sum + (a.timesListened || 0), 0);
-  const ratedAlbums = library.filter((a) => a.rating > 0);
+  const ratedAlbums = library.filter(isRated);
   const avgRating = ratedAlbums.length ? ratedAlbums.reduce((s, a) => s + a.rating, 0) / ratedAlbums.length : 0;
 
   const mostListened = library.reduce(
@@ -1312,8 +1766,8 @@ function computeStats() {
     null
   );
 
-  const distribution = [0, 0, 0, 0, 0]; // index 0 = 1 star ... index 4 = 5 star
-  ratedAlbums.forEach((a) => distribution[a.rating - 1]++);
+  const distribution = new Array(11).fill(0); // index = rating * 2 (0, 0.5, ... 5)
+  ratedAlbums.forEach((a) => distribution[Math.round(a.rating * 2)]++);
 
   const artistMap = new Map();
   library.forEach((a) => {
@@ -1324,7 +1778,7 @@ function computeStats() {
     const entry = artistMap.get(key);
     entry.albums += 1;
     entry.totalListens += a.timesListened || 0;
-    if (a.rating > 0) {
+    if (isRated(a)) {
       entry.ratingSum += a.rating;
       entry.ratingCount += 1;
     }
@@ -1339,15 +1793,16 @@ function computeStats() {
     .sort((a, b) => b.totalListens - a.totalListens);
 
   const genreMap = new Map();
-  library.forEach((a) => {
-    const key = (a.genre || "").trim() || "Unknown";
+  // An album with several genre tags counts toward each of them.
+  library.flatMap((a) => (a.genres && a.genres.length ? a.genres : ["Unknown"]).map((g) => [g, a])).forEach(([g, a]) => {
+    const key = g.toLowerCase();
     if (!genreMap.has(key)) {
-      genreMap.set(key, { genre: key, albums: 0, totalListens: 0, ratingSum: 0, ratingCount: 0 });
+      genreMap.set(key, { genre: g, albums: 0, totalListens: 0, ratingSum: 0, ratingCount: 0 });
     }
     const entry = genreMap.get(key);
     entry.albums += 1;
     entry.totalListens += a.timesListened || 0;
-    if (a.rating > 0) {
+    if (isRated(a)) {
       entry.ratingSum += a.rating;
       entry.ratingCount += 1;
     }
@@ -1362,6 +1817,25 @@ function computeStats() {
     .sort((a, b) => b.albums - a.albums);
 
   return { totalAlbums, totalListens, avgRating, mostListened, distribution, artistStats, genreStats };
+}
+
+function renderTagStats() {
+  const tags = allUsedTags("tags");
+  if (!tags.length) return "";
+  const rows = tags
+    .map((t) => {
+      const albums = library.filter((a) => (a.tags || []).some((x) => x.toLowerCase() === t.name.toLowerCase()));
+      const rated = albums.filter(isRated);
+      const avg = rated.length ? rated.reduce((s, a) => s + a.rating, 0) / rated.length : null;
+      return `<tr><td>${escapeHtml(t.name)}</td><td>${albums.length}</td><td>${avg != null ? avg.toFixed(1) + " ★" : "—"}</td></tr>`;
+    })
+    .join("");
+  return `
+    <h3>By tag</h3>
+    <table class="stats-table">
+      <thead><tr><th>Tag</th><th>Albums</th><th>Avg rating</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
 }
 
 // Every rating-history entry is a timestamped "you touched this album" event
@@ -1418,10 +1892,10 @@ function openStatsModal() {
   const maxDist = Math.max(...stats.distribution, 1);
   const distRows = stats.distribution
     .map((count, i) => {
-      const stars = i + 1;
+      const stars = i / 2;
       return `
         <div class="bar-row">
-          <span class="bar-label">${stars}★</span>
+          <span class="bar-label">${formatRating(stars)}</span>
           <div class="bar-track"><div class="bar-fill" style="width:${(count / maxDist) * 100}%"></div></div>
           <span class="bar-count">${count}</span>
         </div>
@@ -1499,6 +1973,8 @@ function openStatsModal() {
       <thead><tr><th>Artist</th><th>Albums</th><th>Listens</th><th>Avg rating</th></tr></thead>
       <tbody>${artistRows}</tbody>
     </table>
+
+    ${renderTagStats()}
 
     <h3>By genre</h3>
     <table class="stats-table">
@@ -1803,9 +2279,14 @@ document.getElementById("clearLastfmKeyBtn").addEventListener("click", () => {
 // ---------- Search / sort listeners ----------
 searchBox.addEventListener("input", renderLibrary);
 sortSelect.addEventListener("change", renderLibrary);
+tagFilterEl.addEventListener("change", () => {
+  activeArtistFilter = null;
+  renderLibrary();
+});
 
 // ---------- Init ----------
 renderFolderFilterOptions();
+renderTagFilterOptions();
 renderLibrary();
 
 // Deep link from explore.html's "+ Add to library" links (?addArtist=Name)
