@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Album Tracker</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="theme-color" content="#12131a">
+</head>
+<body>
+  <header class="app-header">
+    <h1>🎧 Album Tracker</h1>
+    <div class="header-actions">
+      <input id="searchBox" type="text" placeholder="Search your library...">
+      <div class="view-toggle">
+        <button id="viewAlbumsBtn" class="view-toggle-btn active" type="button">Albums</button>
+        <button id="viewArtistsBtn" class="view-toggle-btn" type="button">Artists</button>
+      </div>
+      <select id="folderFilter" title="Filter by folder">
+        <option value="all">All Folders</option>
+        <option value="unsorted">Unsorted</option>
+      </select>
+      <button id="manageFoldersBtn" title="Create, rename, or delete folders">📁 Folders</button>
+      <button id="selectModeBtn" title="Select multiple albums for bulk actions">☑ Select</button>
+      <select id="sortSelect">
+        <option value="dateAdded-desc">Newest added</option>
+        <option value="dateAdded-asc">Oldest added</option>
+        <option value="rating-desc">Highest rated</option>
+        <option value="rating-asc">Lowest rated</option>
+        <option value="timesListened-desc">Most listened</option>
+        <option value="lastListened-desc">Recently listened</option>
+        <option value="title-asc">Title A-Z</option>
+        <option value="artist-asc">Artist A-Z</option>
+        <option value="order-asc">Custom Order</option>
+      </select>
+      <button id="addAlbumBtn" class="primary-btn">+ Add Album</button>
+      <button id="forYouBtn" title="Get recommendations based on your ratings">💡 For You</button>
+      <a href="explore.html" class="btn-link" title="Browse the rock influence map">🌳 Explore</a>
+      <button id="statsBtn" title="See listening stats">📊 Stats</button>
+      <button id="exportBtn" title="Download a backup of your library">Export</button>
+      <button id="importBtn" title="Restore from a backup file">Import</button>
+      <input id="importFile" type="file" accept="application/json" hidden>
+    </div>
+  </header>
+
+  <div id="activeFilterChip" class="active-filter-chip" hidden>
+    <span id="activeFilterText"></span>
+    <button id="clearFilterBtn" type="button">✕</button>
+  </div>
+
+  <div id="bulkActionBar" class="bulk-action-bar" hidden>
+    <span id="bulkSelectedCount">0 selected</span>
+    <select id="bulkFolderSelect">
+      <option value="">Add to folder...</option>
+    </select>
+    <button id="bulkAddToFolderBtn" type="button">Add to Folder</button>
+    <button id="bulkDeleteBtn" type="button" class="danger-btn">Delete Selected</button>
+    <div class="footer-spacer"></div>
+    <button id="bulkCancelBtn" type="button">Cancel</button>
+  </div>
+
+  <main id="library" class="library-grid"></main>
+  <p id="emptyState" class="empty-state" hidden>No albums yet. Click "+ Add Album" to log your first one.</p>
+
+  <!-- Add / Edit Modal -->
+  <div id="albumModal" class="modal-overlay" hidden>
+    <div class="modal">
+      <button class="modal-close" id="closeModalBtn">&times;</button>
+      <h2 id="modalTitle">Add Album</h2>
+
+      <div class="modal-body">
+        <div class="modal-left">
+          <div class="cover-preview">
+            <img id="coverPreview" src="" alt="Album cover" hidden>
+            <div id="coverPlaceholder" class="cover-placeholder">No cover yet</div>
+          </div>
+
+          <label>Artist
+            <input id="artistInput" type="text" placeholder="e.g. Radiohead">
+          </label>
+          <label>Album Title
+            <input id="titleInput" type="text" placeholder="e.g. In Rainbows">
+          </label>
+          <a id="spotifyLink" class="spotify-btn disabled" href="#" target="_blank" rel="noopener noreferrer">🎧 Open in Spotify</a>
+          <button id="autofillBtn" type="button">🔍 Search &amp; Auto-fill</button>
+          <p id="autofillStatus" class="status-text"></p>
+          <div id="candidateList" class="candidate-list"></div>
+
+          <label>Year
+            <input id="yearInput" type="text" placeholder="e.g. 2007">
+          </label>
+          <label>Genre
+            <input id="genreInput" type="text" placeholder="e.g. Alternative Rock">
+          </label>
+          <label>Folders
+            <div id="folderCheckboxList" class="folder-checkbox-list"></div>
+          </label>
+
+          <label>Rating
+            <div id="ratingStars" class="star-rating"></div>
+          </label>
+
+          <label>Times Listened
+            <div class="counter">
+              <button id="decrementBtn" type="button">−</button>
+              <input id="timesListenedInput" type="number" min="0" value="0">
+              <button id="incrementBtn" type="button">+</button>
+            </div>
+            <p id="lastListenedText" class="hint" style="margin:6px 0 0;"></p>
+          </label>
+
+          <label>Notes / Review
+            <textarea id="notesInput" rows="4" placeholder="Thoughts on this album..."></textarea>
+          </label>
+
+          <div id="ratingHistorySection" hidden>
+            <label>Rating History</label>
+            <ul id="ratingHistoryList" class="rating-history-list"></ul>
+          </div>
+        </div>
+
+        <div class="modal-right">
+          <h3>Tracklist</h3>
+          <p class="hint">Click ♥ to mark a favorite track, 👎 to mark a least-favorite. Add tracks manually if auto-fill didn't find them.</p>
+          <ul id="trackList" class="track-list"></ul>
+          <div class="add-track-row">
+            <input id="newTrackInput" type="text" placeholder="Add a track manually...">
+            <button id="addTrackBtn" type="button">Add</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button id="deleteAlbumBtn" class="danger-btn" hidden>Delete Album</button>
+        <div class="footer-spacer"></div>
+        <button id="cancelBtn">Cancel</button>
+        <button id="saveAlbumBtn" class="primary-btn">Save Album</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Folders Modal -->
+  <div id="foldersModal" class="modal-overlay" hidden>
+    <div class="modal modal-small">
+      <button class="modal-close" id="closeFoldersBtn">&times;</button>
+      <h2>Folders</h2>
+      <div class="add-folder-row">
+        <input id="newFolderIcon" type="text" maxlength="2" placeholder="📁" class="folder-icon-input">
+        <input id="newFolderInput" type="text" placeholder="New folder name...">
+        <input id="newFolderColor" type="color" value="#7c9cff" class="folder-color-input" title="Folder color">
+        <button id="addFolderBtn" type="button">Add</button>
+      </div>
+      <ul id="foldersList" class="folders-list"></ul>
+    </div>
+  </div>
+
+  <!-- Stats Modal -->
+  <div id="statsModal" class="modal-overlay" hidden>
+    <div class="modal">
+      <button class="modal-close" id="closeStatsBtn">&times;</button>
+      <h2>Your Listening Stats</h2>
+      <div id="statsBody" class="stats-body"></div>
+    </div>
+  </div>
+
+  <!-- For You (Recommendations) Modal -->
+  <div id="forYouModal" class="modal-overlay" hidden>
+    <div class="modal">
+      <button class="modal-close" id="closeForYouBtn">&times;</button>
+      <h2>Recommended For You</h2>
+      <div class="for-you-header-row">
+        <p class="hint" style="margin:0;">Based on artists you rated 4★ or higher. A curated influence map runs for free; adding a Last.fm key layers on a second opinion for every rated artist — when both agree you get one combined card, when they don't you get both picks.</p>
+        <button id="lastfmSettingsBtn" type="button">⚙ Last.fm Key</button>
+      </div>
+      <div id="forYouBody" class="stats-body"></div>
+    </div>
+  </div>
+
+  <!-- Last.fm Settings Modal -->
+  <div id="lastfmModal" class="modal-overlay" hidden>
+    <div class="modal modal-small">
+      <button class="modal-close" id="closeLastfmBtn">&times;</button>
+      <h2>Last.fm Recommendations</h2>
+      <p class="hint">Optional: add a free Last.fm API key to get a second opinion on every rated artist, covering any genre — not just rock/punk/metal/indie. Where it agrees with the influence map you get one combined card; where it doesn't, you get both suggestions. <a href="https://www.last.fm/api/account/create" target="_blank" rel="noopener noreferrer">Get a free key →</a></p>
+      <label>API Key
+        <input id="lastfmKeyInput" type="text" placeholder="Paste your Last.fm API key">
+      </label>
+      <div class="modal-footer">
+        <button id="clearLastfmKeyBtn" class="danger-btn" type="button">Remove Key</button>
+        <div class="footer-spacer"></div>
+        <button id="saveLastfmKeyBtn" class="primary-btn" type="button">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="influence-data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
