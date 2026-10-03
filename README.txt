@@ -6,8 +6,12 @@ want a backup anyway.)
 
 1. Close the Album Tracker app/tab.
 2. Delete everything in your Album Tracker folder and put all of these files in.
-3. Double-click Install_App.bat (or open http://localhost:8080/index.html).
-4. Press Ctrl+Shift+R once so the browser drops its old cached copy.
+3. Double-click Install_App.bat in THIS folder. It first stops any Album
+   Tracker server still running in the background from the old folder, then
+   starts a fresh one and opens http://localhost:8080/index.html.
+   The window shows "Starting Album Tracker from: ..." - check that's this folder.
+4. The first time, the page may refresh itself once as it swaps out the old
+   cached version. If it still looks old, press Ctrl+Shift+R.
 
 Do NOT use the browser's "Clear site data" / "Clear browsing data" options for
 this site: that WOULD delete your albums.
@@ -22,4 +26,4 @@ Files
                      the newest files when you're online
   manifest.json      app name and icons for installing
   icon-192.png, icon-512.png   app icons
-  Install_App.bat    starts the local server on port 8080 and opens the app
+  Install_App.bat    stops any old server, starts this one on port 8080, opens the app

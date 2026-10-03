@@ -28,10 +28,17 @@ self.addEventListener("install", (event) => {
 
 self.addEventListener("activate", (event) => {
   event.waitUntil(
-    caches
-      .keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
-      .then(() => self.clients.claim())
+    caches.keys().then(async (keys) => {
+      const old = keys.filter((k) => k !== CACHE);
+      await Promise.all(old.map((k) => caches.delete(k)));
+      await self.clients.claim();
+      // Upgrading from an older version: any open tab is still showing the old
+      // cached page, so reload it once onto the new files.
+      if (old.length) {
+        const tabs = await self.clients.matchAll({ type: "window" });
+        tabs.forEach((tab) => tab.navigate(tab.url).catch(() => {}));
+      }
+    })
   );
 });
 
