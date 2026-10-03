@@ -18,6 +18,9 @@ function normalizeAlbum(a, idx) {
   // Old single-folder model (folderId) -> multi-folder (folderIds).
   const migrated = a.folderIds ? { ...a } : { ...a, folderIds: a.folderId ? [a.folderId] : [] };
   migrated.order = typeof migrated.order === "number" ? migrated.order : idx;
+  // Custom order is kept separately per view: "all", "folder:<id>", "artist:<name>".
+  if (!migrated.customOrder || typeof migrated.customOrder !== "object") migrated.customOrder = {};
+  if (typeof migrated.customOrder.all !== "number") migrated.customOrder.all = migrated.order;
   migrated.lastListened = migrated.lastListened || null;
 
   // Ratings used to be whole stars where 0 meant "not rated". Now 0-5 in half
@@ -209,9 +212,11 @@ const formatInput = document.getElementById("formatInput");
 const recommendedByInput = document.getElementById("recommendedByInput");
 const firstListenedInput = document.getElementById("firstListenedInput");
 const trackSummaryEl = document.getElementById("trackSummary");
+const customOrderHintEl = document.getElementById("customOrderHint");
 
 let currentRating = null;
 let currentGenres = [];
+let genreWasAutoFilled = false; // true while the genre chips came from a search pick
 let currentTags = [];
 let currentCoverUrl = "";
 let selectMode = false;
@@ -220,6 +225,7 @@ let selectedIds = new Set();
 // ---------- Rendering: library grid ----------
 function renderLibrary() {
   updateActiveFilterChip();
+  updateCustomOrderHint();
 
   const tagFilter = tagFilterEl.value;
   const folderScoped = library.filter((a) => {
@@ -230,7 +236,7 @@ function renderLibrary() {
   });
 
   if (activeArtistFilter) {
-    renderAlbumCards(folderScoped.filter((a) => a.artist === activeArtistFilter));
+    renderAlbumCards(sortAlbums(folderScoped.filter((a) => a.artist === activeArtistFilter)));
     return;
   }
 
@@ -247,8 +253,13 @@ function renderLibrary() {
       .some((field) => (field || "").toLowerCase().includes(query));
   });
 
+  renderAlbumCards(sortAlbums(items));
+}
+
+function sortAlbums(items) {
+  if (isCustomSort()) return sortByCustomOrder(items, customOrderKey());
   const [sortKey, sortDir] = sortSelect.value.split("-");
-  items.sort((a, b) => {
+  return items.sort((a, b) => {
     // Unrated albums always go to the bottom, whichever direction you sort ratings.
     if (sortKey === "rating" && isRated(a) !== isRated(b)) return isRated(a) ? -1 : 1;
     let va = a[sortKey];
@@ -265,8 +276,64 @@ function renderLibrary() {
     if (va > vb) return sortDir === "asc" ? 1 : -1;
     return 0;
   });
+}
 
-  renderAlbumCards(items);
+// ---------- Custom order (per folder / per artist) ----------
+// Every view keeps its own arrangement: the whole library, each folder, the
+// "Unsorted" view and each artist. Positions live on the album itself
+// (album.customOrder[key]) so they're included in Export/Import backups.
+function isCustomSort() {
+  return sortSelect.value === "order-asc";
+}
+
+function customOrderKey() {
+  if (activeArtistFilter) return "artist:" + normText(activeArtistFilter);
+  if (currentFolderFilter !== "all") return "folder:" + currentFolderFilter;
+  return "all";
+}
+
+function customOrderLabel() {
+  if (activeArtistFilter) return `albums by ${activeArtistFilter}`;
+  if (currentFolderFilter === "unsorted") return "the Unsorted view";
+  if (currentFolderFilter !== "all") {
+    const f = folders.find((x) => x.id === currentFolderFilter);
+    return f ? `the "${f.name}" folder` : "this folder";
+  }
+  return "your whole library";
+}
+
+// Albums never arranged in this view go after the arranged ones, following
+// the library-wide order, then the date they were added.
+function sortByCustomOrder(items, key) {
+  const pos = (a) => (a.customOrder && typeof a.customOrder[key] === "number" ? a.customOrder[key] : null);
+  const allPos = (a) => (a.customOrder && typeof a.customOrder.all === "number" ? a.customOrder.all : Infinity);
+  return items.sort((a, b) => {
+    const pa = pos(a);
+    const pb = pos(b);
+    if ((pa === null) !== (pb === null)) return pa === null ? 1 : -1;
+    if (pa !== null && pa !== pb) return pa - pb;
+    if (allPos(a) !== allPos(b)) return allPos(a) - allPos(b);
+    return (a.dateAdded || "").localeCompare(b.dateAdded || "");
+  });
+}
+
+// Every album that belongs to the current view, ignoring the search box and
+// tag filter, so reordering a filtered subset doesn't scramble the rest.
+function albumsInOrderContext() {
+  if (activeArtistFilter) return library.filter((a) => a.artist === activeArtistFilter);
+  if (currentFolderFilter === "unsorted") return library.filter((a) => (a.folderIds || []).length === 0);
+  if (currentFolderFilter !== "all") return library.filter((a) => (a.folderIds || []).includes(currentFolderFilter));
+  return [...library];
+}
+
+function updateCustomOrderHint() {
+  const show = isCustomSort() && !selectMode;
+  customOrderHintEl.hidden = !show;
+  if (!show) return;
+  customOrderHintEl.textContent =
+    viewMode === "artists" && !activeArtistFilter
+      ? "Custom order: open an artist to arrange their albums. Each artist and each folder keeps its own order."
+      : `Custom order for ${customOrderLabel()}: drag albums, or use the ◀ ▶ buttons. Each folder and each artist keeps its own order.`;
 }
 
 function setEmptyMessage(isEmpty, filteredMessage) {
@@ -284,9 +351,9 @@ function renderAlbumCards(items) {
   libraryEl.innerHTML = "";
   setEmptyMessage(items.length === 0, "No albums match the current filters.");
 
-  const dragEnabled = !selectMode && sortSelect.value === "order-asc" && !activeArtistFilter && viewMode === "albums";
+  const dragEnabled = !selectMode && isCustomSort();
 
-  items.forEach((album) => {
+  items.forEach((album, idx) => {
     const card = document.createElement("div");
     card.className = "album-card" + (selectedIds.has(album.id) ? " selected" : "");
     card.dataset.id = album.id;
@@ -339,6 +406,15 @@ function renderAlbumCards(items) {
         ${favTrack ? `<div class="card-fav" title="Favorite track">♥ ${escapeHtml(favTrack.name)}</div>` : ""}
         ${chipsHtml ? `<div class="card-chips">${chipsHtml}</div>` : ""}
         ${folderTagsHtml}
+        ${
+          dragEnabled
+            ? `<div class="card-move">
+                <button type="button" data-move="-1" title="Move earlier" ${idx === 0 ? "disabled" : ""}>◀</button>
+                <span>#${idx + 1}</span>
+                <button type="button" data-move="1" title="Move later" ${idx === items.length - 1 ? "disabled" : ""}>▶</button>
+              </div>`
+            : ""
+        }
       </div>
     `;
     const imgEl = card.querySelector("img");
@@ -367,6 +443,14 @@ function renderAlbumCards(items) {
       });
     }
 
+    card.querySelectorAll(".card-move button").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const neighbor = items[idx + Number(btn.dataset.move)];
+        if (neighbor) reorderAlbums(album.id, neighbor.id);
+      });
+    });
+
     if (dragEnabled) {
       card.draggable = true;
       card.addEventListener("dragstart", (e) => {
@@ -384,7 +468,7 @@ function renderAlbumCards(items) {
         e.preventDefault();
         card.classList.remove("drag-over");
         const draggedId = e.dataTransfer.getData("text/plain");
-        if (draggedId && draggedId !== album.id) reorderAlbums(draggedId, album.id, items);
+        if (draggedId && draggedId !== album.id) reorderAlbums(draggedId, album.id);
       });
     }
 
@@ -416,18 +500,20 @@ function quickIncrementListen(id) {
   renderLibrary();
 }
 
-// Drag-and-drop custom ordering: assign new `order` values across the
-// currently-visible (filtered) set based on where the card was dropped,
-// so the manual order persists independent of whatever filter is active.
-function reorderAlbums(draggedId, targetId, visibleItems) {
-  const ids = visibleItems.map((a) => a.id);
-  const fromIdx = ids.indexOf(draggedId);
-  const toIdx = ids.indexOf(targetId);
+// Moves an album to the target's spot in the current view's custom order
+// (dropping onto a later album places it after that album, onto an earlier
+// one places it before). Only this view's order changes.
+function reorderAlbums(draggedId, targetId) {
+  const key = customOrderKey();
+  const ordered = sortByCustomOrder(albumsInOrderContext(), key);
+  const fromIdx = ordered.findIndex((a) => a.id === draggedId);
+  const toIdx = ordered.findIndex((a) => a.id === targetId);
   if (fromIdx === -1 || toIdx === -1) return;
-  ids.splice(toIdx, 0, ids.splice(fromIdx, 1)[0]);
-  ids.forEach((id, idx) => {
-    const album = library.find((a) => a.id === id);
-    if (album) album.order = idx;
+  ordered.splice(toIdx, 0, ordered.splice(fromIdx, 1)[0]);
+  ordered.forEach((album, i) => {
+    album.customOrder = album.customOrder || {};
+    album.customOrder[key] = i;
+    if (key === "all") album.order = i;
   });
   saveLibrary();
   renderLibrary();
@@ -611,6 +697,7 @@ function renderChips(container, input, list, className, onRemove) {
 
 function renderGenreChips() {
   renderChips(genreChipsEl, genreInput, currentGenres, "genre", (idx) => {
+    genreWasAutoFilled = false;
     currentGenres.splice(idx, 1);
     renderGenreChips();
   });
@@ -644,7 +731,10 @@ function commitChipInput(input, kind) {
   const parts = splitTags(input.value);
   if (!parts.length) return false;
   parts.forEach((p) => {
-    if (kind === "genre") currentGenres = addUniqueTag(currentGenres, p);
+    if (kind === "genre") {
+      currentGenres = addUniqueTag(currentGenres, p);
+      genreWasAutoFilled = false;
+    }
     else currentTags = addUniqueTag(currentTags, p);
   });
   input.value = "";
@@ -794,6 +884,7 @@ function openModal(id) {
   genreInput.value = "";
   tagInput.value = "";
   currentGenres = [...(album?.genres || [])];
+  genreWasAutoFilled = false;
   currentTags = [...(album?.tags || [])];
   formatInput.value = album?.format || "";
   recommendedByInput.value = album?.recommendedBy || "";
@@ -932,6 +1023,7 @@ document.getElementById("saveAlbumBtn").addEventListener("click", () => {
     ratingHistory,
     lastListened: listensIncreased ? new Date().toISOString() : prevAlbum?.lastListened || null,
     order: typeof prevAlbum?.order === "number" ? prevAlbum.order : maxOrder + 1,
+    customOrder: prevAlbum?.customOrder || { all: maxOrder + 1 },
     dateAdded: editingId
       ? library.find((a) => a.id === editingId).dateAdded
       : new Date().toISOString(),
@@ -1062,6 +1154,7 @@ function renderFoldersList() {
       if (!confirm(`Delete folder "${f.name}"? Albums inside will just be removed from it — they won't be deleted.`)) return;
       library.forEach((a) => {
         a.folderIds = (a.folderIds || []).filter((id) => id !== f.id);
+        if (a.customOrder) delete a.customOrder["folder:" + f.id];
       });
       folders = folders.filter((x) => x.id !== f.id);
       saveFolders();
@@ -1242,7 +1335,19 @@ function baseTitle(title) {
   return (title || "")
     .replace(/\s*[\(\[]([^\)\]]*)[\)\]]/g, (m, inner) => (EDITION_WORDS.test(inner) ? "" : m))
     .replace(/\s+-\s+(single|ep)\s*$/i, "")
+    .replace(/\s+[-–:]\s+([^-–:]*)$/, (m, tail) => (EDITION_WORDS.test(tail) ? "" : m))
     .trim();
+}
+
+// Deluxe / remastered / anniversary / expanded etc. Anything that isn't the
+// plain studio release. "Deluxe" or "Remastered" anywhere counts, as does an
+// edition word in brackets or after a dash ("Abbey Road (Super Deluxe Edition)",
+// "Rumours - 35th Anniversary"). Bare words like "Version" only count when
+// bracketed, so an album actually titled "...Version..." isn't flagged.
+const STRONG_EDITION_RE = /\b(deluxe|remaster(ed)?|expanded|anniversary|collector'?s|super deluxe|bonus tracks?|reissue)\b/i;
+function isEditionTitle(title) {
+  const t = title || "";
+  return STRONG_EDITION_RE.test(t) || baseTitle(t) !== t.replace(/\s+-\s+(single|ep)\s*$/i, "").trim();
 }
 
 const JUNK_RE = /karaoke|tribute|made famous|in the style of|lullaby|8[- ]?bit|piano versions?|string quartet|cover versions?|as performed by|instrumental versions/i;
@@ -1290,8 +1395,11 @@ function scoreCandidate(c, queryArtist, queryTitle) {
   let penalty = 0;
   if (JUNK_RE.test(rawTitle) || JUNK_RE.test(c.artist || "")) penalty += 0.4;
   if (c.kind === "Single" || c.kind === "EP") penalty += 0.15;
-  if ((c.kind === "Live" || c.kind === "Compilation" || LIVE_COMP_RE.test(rawTitle)) && !typed(LIVE_COMP_RE)) penalty += 0.1;
-  if (EDITION_WORDS.test(rawTitle.replace(baseTitle(rawTitle), "")) && !typed(EDITION_WORDS)) penalty += 0.04;
+  if ((c.kind === "Live" || c.kind === "Compilation" || c.kind === "Other" || LIVE_COMP_RE.test(rawTitle)) && !typed(LIVE_COMP_RE))
+    penalty += 0.12;
+  // Deluxe/remastered editions sit clearly below the studio album unless you
+  // typed an edition word yourself ("in rainbows deluxe").
+  if (isEditionTitle(rawTitle) && !typed(EDITION_WORDS)) penalty += 0.25;
   if (c.trackCount && c.trackCount <= 3) penalty += 0.08;
 
   // 4. Small nudges for signals of "the well-known release": the source's
@@ -1303,7 +1411,20 @@ function scoreCandidate(c, queryArtist, queryTitle) {
 
 function rankCandidates(candidates, queryArtist, queryTitle) {
   candidates.forEach((c) => (c.score = scoreCandidate(c, queryArtist, queryTitle)));
-  return candidates.sort((a, b) => b.score - a.score);
+  // Keep every version of the same album together, ranked by the best-scoring
+  // one, and always put the plain studio release first within that group, so
+  // a deluxe edition can never sit above its own standard album.
+  const groupKey = (c) => normText(c.artist) + "|" + normText(baseTitle(c.title));
+  const groupBest = new Map();
+  candidates.forEach((c) => groupBest.set(groupKey(c), Math.max(groupBest.get(groupKey(c)) ?? -Infinity, c.score)));
+  const typedEdition = EDITION_WORDS.test(`${queryArtist} ${queryTitle}`);
+  return candidates.sort(
+    (a, b) =>
+      groupBest.get(groupKey(b)) - groupBest.get(groupKey(a)) ||
+      groupKey(a).localeCompare(groupKey(b)) ||
+      (typedEdition ? 0 : isEditionTitle(a.title) - isEditionTitle(b.title)) ||
+      b.score - a.score
+  );
 }
 
 async function searchItunes(artist, title) {
@@ -1354,24 +1475,25 @@ async function fetchMusicBrainzTracklist(releaseGroupId) {
   const res = await fetch(url);
   if (!res.ok) return [];
   const data = await res.json();
-  // Not every release in a group has full track data attached — some are
-  // stub/promo entries, or a truncated regional pressing. Scan all of them
-  // and keep whichever has the MOST tracks (ties broken by Official status)
-  // instead of just taking the first one that has anything at all.
-  let best = [];
-  let bestIsOfficial = false;
-  (data.releases || []).forEach((release) => {
-    const tracks = [];
-    (release.media || []).forEach((medium) => {
-      (medium.tracks || []).forEach((t) => tracks.push(t.title));
-    });
-    const isOfficial = release.status === "Official";
-    if (tracks.length > best.length || (tracks.length === best.length && isOfficial && !bestIsOfficial)) {
-      best = tracks;
-      bestIsOfficial = isOfficial;
-    }
-  });
-  return best;
+  // A release group holds every pressing of the album: the original, plus
+  // deluxe/remaster/anniversary reissues with bonus discs. Use the original
+  // studio release: official, not an edition, earliest date. Releases with no
+  // track data at all (stubs) are skipped.
+  const releases = (data.releases || [])
+    .map((release) => {
+      const tracks = [];
+      (release.media || []).forEach((medium) => (medium.tracks || []).forEach((t) => tracks.push(t.title)));
+      const editionText = `${release.title || ""} ${release.disambiguation || ""}`;
+      return {
+        tracks,
+        official: release.status === "Official" ? 0 : 1,
+        edition: STRONG_EDITION_RE.test(editionText) || EDITION_WORDS.test(release.disambiguation || "") ? 1 : 0,
+        date: release.date || "9999",
+      };
+    })
+    .filter((r) => r.tracks.length > 0)
+    .sort((a, b) => a.edition - b.edition || a.official - b.official || a.date.localeCompare(b.date));
+  return releases.length ? releases[0].tracks : [];
 }
 
 async function fetchItunesTracklist(collectionId) {
@@ -1391,24 +1513,28 @@ async function fetchTracklistForCandidate(candidate) {
 // Looks up the same album on whichever source the candidate DIDN'T come
 // from, using the now-confirmed artist/title, so selectCandidate can compare
 // both and keep whichever tracklist is actually more complete.
+// Returns { tracks, genre } (genre may be "").
 async function fetchTracklistFallback(candidate) {
+  const wanted = normText(baseTitle(candidate.title));
+  const sameAlbum = (title) => normText(baseTitle(title)) === wanted;
   try {
     if (candidate.source === "itunes") {
-      const mbResults = await searchMusicBrainz(candidate.artist, candidate.title);
-      const match =
-        mbResults.find((rg) => rg.title.toLowerCase() === candidate.title.toLowerCase()) || mbResults[0];
-      if (match) return await fetchMusicBrainzTracklist(match.id);
+      const mbResults = await searchMusicBrainz(candidate.artist, baseTitle(candidate.title));
+      const match = mbResults.find((rg) => sameAlbum(rg.title)) || mbResults[0];
+      if (match) return { tracks: await fetchMusicBrainzTracklist(match.id), genre: mbTagsToGenre(match.tags) };
     } else {
       const itunesResults = await searchItunes(candidate.artist, candidate.title);
+      // Prefer the plain studio release over a deluxe one with the same name.
       const match =
-        itunesResults.find((r) => r.collectionName?.toLowerCase() === candidate.title.toLowerCase()) ||
+        itunesResults.find((r) => sameAlbum(r.collectionName) && !isEditionTitle(r.collectionName)) ||
+        itunesResults.find((r) => sameAlbum(r.collectionName)) ||
         itunesResults[0];
-      if (match) return await fetchItunesTracklist(match.collectionId);
+      if (match) return { tracks: await fetchItunesTracklist(match.collectionId), genre: match.primaryGenreName || "" };
     }
   } catch (err) {
     console.error(err);
   }
-  return [];
+  return { tracks: [], genre: "" };
 }
 
 async function searchMusicBrainzByArtist(artist) {
@@ -1487,13 +1613,31 @@ function addMusicBrainzCandidates(results, candidates, seenKeys) {
       title: rg.title,
       artist: artistName,
       year: rg["first-release-date"] ? rg["first-release-date"].slice(0, 4) : "",
-      genre: "",
+      genre: mbTagsToGenre(rg.tags),
       coverUrl: `https://coverartarchive.org/release-group/${rg.id}/front-500`,
-      kind: secondary.includes("Live") ? "Live" : secondary.includes("Compilation") ? "Compilation" : rg["primary-type"] || "Album",
+      kind: secondary.includes("Live")
+        ? "Live"
+        : secondary.includes("Compilation")
+        ? "Compilation"
+        : secondary.length
+        ? "Other"
+        : rg["primary-type"] || "Album",
       rank: results.length > 1 ? i / (results.length - 1) : 0,
       raw: rg.id,
     });
   });
+}
+
+// MusicBrainz has no single "genre" field, but its community tags are mostly
+// genres. Take the two most-voted ones, skipping obvious non-genre tags.
+const NON_GENRE_TAGS = /^(\d{4}s?|seen live|favorite|favourites?|albums? i own|english|american|british|uk|usa)$/i;
+function mbTagsToGenre(tags) {
+  return (tags || [])
+    .filter((t) => t.count > 0 && t.name && !NON_GENRE_TAGS.test(t.name))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 2)
+    .map((t) => t.name.replace(/\b\w/g, (ch) => ch.toUpperCase()))
+    .join(", ");
 }
 
 // ---------- Search-as-you-type ----------
@@ -1565,7 +1709,7 @@ async function autofillSearch() {
     // The artist's own full albums first (oldest to newest), then anything by
     // other artists, singles/EPs, live sets and knock-offs.
     candidates.forEach((c) => (c.score = scoreCandidate(c, artist, "")));
-    const tier = (c) => (c.score < 0.75 ? 2 : c.kind === "Album" && !JUNK_RE.test(c.title) ? 0 : 1);
+    const tier = (c) => (c.score < 0.75 ? 2 : c.kind === "Album" && !JUNK_RE.test(c.title) && !isEditionTitle(c.title) ? 0 : 1);
     candidates.sort((a, b) => tier(a) - tier(b) || (parseInt(a.year) || 9999) - (parseInt(b.year) || 9999));
     autofillStatus.textContent = `Found ${candidates.length} album${candidates.length === 1 ? "" : "s"} by ${artist} — pick one:`;
     renderCandidates(candidates);
@@ -1664,10 +1808,16 @@ async function selectCandidate(candidate) {
   lastSearchKey = normText(candidate.artist) + "|" + normText(candidate.title);
   updateSpotifyLink();
   if (candidate.year) yearInput.value = candidate.year;
-  if (candidate.genre && currentGenres.length === 0) {
-    splitTags(candidate.genre).forEach((g) => (currentGenres = addUniqueTag(currentGenres, g)));
+  // Genre is filled automatically (unless you've already typed some). This
+  // replaces anything auto-filled from a previously picked result.
+  const fillGenre = (genre) => {
+    if (!genre || (currentGenres.length && !genreWasAutoFilled)) return;
+    currentGenres = [];
+    splitTags(genre).forEach((g) => (currentGenres = addUniqueTag(currentGenres, g)));
+    genreWasAutoFilled = true;
     renderGenreChips();
-  }
+  };
+  fillGenre(candidate.genre);
   currentCoverUrl = candidate.coverUrl || "";
   coverPlaceholder.textContent = "No cover yet";
   updateCoverPreview();
@@ -1684,20 +1834,31 @@ async function selectCandidate(candidate) {
     ]);
     if (seq !== searchSeq) return; // user picked something else / closed the form meanwhile
     const primaryTracks = primaryResult.status === "fulfilled" ? primaryResult.value : [];
-    const otherTracks = otherResult.status === "fulfilled" ? otherResult.value : [];
+    const other = otherResult.status === "fulfilled" ? otherResult.value : { tracks: [], genre: "" };
+    const otherTracks = other.tracks;
     const otherSourceName = candidate.source === "itunes" ? "MusicBrainz" : "iTunes";
+    // iTunes genres are the cleanest; otherwise MusicBrainz tags.
+    if (candidate.source === "musicbrainz" && other.genre) fillGenre(other.genre);
+    else if (!candidate.genre) fillGenre(other.genre);
 
+    // Stick with the version you picked. The other source only fills in when
+    // it found nothing, or (for an iTunes pick) when MusicBrainz's ORIGINAL
+    // release has more tracks, which means iTunes is missing some. It never
+    // swaps in a longer deluxe tracklist.
     let trackNames = primaryTracks;
     let usedOther = false;
-    if (otherTracks.length > primaryTracks.length) {
-      trackNames = otherTracks;
-      usedOther = true;
+    const otherIsOriginal = candidate.source === "itunes";
+    if (primaryTracks.length === 0 || (otherIsOriginal && otherTracks.length > primaryTracks.length)) {
+      if (otherTracks.length) {
+        trackNames = otherTracks;
+        usedOther = true;
+      }
     }
 
     if (trackNames.length > 0) {
       currentTracks = trackNames.map((name) => ({ name, favorite: false, least: false }));
       renderTrackList();
-      const sourceNote = usedOther ? ` (via ${otherSourceName} — more complete)` : "";
+      const sourceNote = usedOther ? ` (via ${otherSourceName})` : "";
       autofillStatus.textContent = `Loaded "${candidate.title}" by ${candidate.artist} — ${trackNames.length} tracks${sourceNote}.`;
     } else {
       autofillStatus.textContent = `Loaded "${candidate.title}" but couldn't find a tracklist on either source. Add tracks manually.`;
@@ -2305,6 +2466,10 @@ renderLibrary();
 // ---------- PWA install support ----------
 if ("serviceWorker" in navigator && (location.protocol === "http:" || location.protocol === "https:")) {
   window.addEventListener("load", () => {
-    navigator.serviceWorker.register("sw.js").catch((err) => console.error("SW registration failed", err));
+    navigator.serviceWorker
+      .register("sw.js")
+      // Check for a newer sw.js on every load so updated app files get picked up.
+      .then((reg) => reg.update())
+      .catch((err) => console.error("SW registration failed", err));
   });
 }
