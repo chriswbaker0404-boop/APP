@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Album Tracker 2</title>
+<link rel="stylesheet" href="styles.css">
+<style>
+  /* Half-star rating, tags and extra fields. Kept inline so a cached styles.css
+     (service worker) can't hide them. */
+  .stars-display{position:relative;display:inline-block;color:var(--text-dim,#555a70);letter-spacing:1px;line-height:1;white-space:nowrap;}
+  .stars-display::before{content:"★★★★★";position:absolute;left:0;top:0;width:var(--pct,0%);overflow:hidden;color:#f5c518;}
+  .stars-display.unrated{opacity:.45;}
+  .rating-row{display:flex;align-items:center;gap:12px;margin-top:4px;}
+  .half-star-rating{display:inline-flex;gap:2px;cursor:pointer;user-select:none;outline:none;border-radius:6px;padding:2px;}
+  .half-star-rating:focus-visible{outline:2px solid #7c9cff;outline-offset:2px;}
+  .hs-star{position:relative;font-size:30px;line-height:1;color:var(--text-dim,#555a70);width:1em;text-align:center;}
+  .hs-star .hs-fill{position:absolute;left:0;top:0;overflow:hidden;color:#f5c518;white-space:nowrap;pointer-events:none;}
+  .hs-star .hs-half{position:absolute;top:0;bottom:0;width:50%;}
+  .hs-star .hs-half.left{left:0;} .hs-star .hs-half.right{right:0;}
+  .rating-value{font-size:14px;font-weight:600;min-width:6em;}
+  .rating-actions{display:flex;gap:6px;margin-top:6px;}
+  .rating-actions button{font-size:12px;padding:3px 10px;}
+  .chip-input{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:6px;border:1px solid var(--border,#33364a);border-radius:8px;background:var(--surface-2,#262837);margin-top:4px;}
+  .chip-input input{flex:1;min-width:140px;border:none !important;background:transparent !important;outline:none;padding:4px !important;margin:0 !important;box-shadow:none !important;}
+  .chip{display:inline-flex;align-items:center;gap:4px;font-size:12px;padding:3px 8px;border-radius:999px;background:rgba(124,156,255,.18);color:#c8d4ff;border:1px solid rgba(124,156,255,.4);}
+  .chip.genre{background:rgba(46,204,113,.14);color:#a8ecc4;border-color:rgba(46,204,113,.4);}
+  .chip button{all:unset;cursor:pointer;opacity:.7;font-size:12px;padding:0 2px;}
+  .chip button:hover{opacity:1;}
+  .quick-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;}
+  .quick-tag{font-size:12px;padding:3px 10px;border-radius:999px;cursor:pointer;border:1px solid var(--border,#33364a);background:transparent;color:inherit;}
+  .quick-tag.on{background:#7c9cff;border-color:#7c9cff;color:#12131a;font-weight:600;}
+  .card-chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px;}
+  .card-chips .chip{font-size:10.5px;padding:1px 7px;}
+  .card-fav{font-size:11.5px;opacity:.8;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .field-pair{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+  .track-summary{margin-top:14px;display:grid;gap:10px;}
+  .track-summary h4{margin:0 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.05em;opacity:.75;}
+  .track-summary ul{margin:0;padding-left:18px;font-size:13.5px;}
+  .candidate-item.best{outline:1px solid #f5c518;}
+  .best-badge{font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:#12131a;background:#f5c518;border-radius:4px;padding:1px 5px;margin-left:6px;vertical-align:middle;}
+  .custom-order-hint{margin:8px 16px;padding:8px 12px;border-left:3px solid #7c9cff;background:rgba(124,156,255,.1);border-radius:0 8px 8px 0;font-size:13px;}
+  .card-move{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:8px;font-size:12px;opacity:.85;}
+  .card-move button{padding:2px 10px;font-size:12px;cursor:pointer;}
+  .card-move button:disabled{opacity:.3;cursor:default;}
+  .album-card[draggable="true"]{cursor:grab;}
+  .album-card.drag-over{outline:2px dashed #7c9cff;outline-offset:2px;}
+  .candidate-kind{font-size:10px;text-transform:uppercase;letter-spacing:.04em;opacity:.7;margin-left:4px;}
+</style>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="theme-color" content="#12131a">
+</head>
+<body>
+  <header class="app-header">
+    <h1>🎧 Album Tracker 2</h1>
+    <div class="header-actions">
+      <input id="searchBox" type="text" placeholder="Search your library...">
+      <div class="view-toggle">
+        <button id="viewAlbumsBtn" class="view-toggle-btn active" type="button">Albums</button>
+        <button id="viewArtistsBtn" class="view-toggle-btn" type="button">Artists</button>
+      </div>
+      <select id="folderFilter" title="Filter by folder">
+        <option value="all">All Folders</option>
+        <option value="unsorted">Unsorted</option>
+      </select>
+      <button id="manageFoldersBtn" title="Create, rename, or delete folders">📁 Folders</button>
+      <button id="selectModeBtn" title="Select multiple albums for bulk actions">☑ Select</button>
+      <select id="tagFilter" title="Filter by genre or tag">
+        <option value="">All genres &amp; tags</option>
+      </select>
+      <select id="sortSelect">
+        <option value="dateAdded-desc">Newest added</option>
+        <option value="dateAdded-asc">Oldest added</option>
+        <option value="rating-desc">Highest rated</option>
+        <option value="rating-asc">Lowest rated</option>
+        <option value="timesListened-desc">Most listened</option>
+        <option value="lastListened-desc">Recently listened</option>
+        <option value="title-asc">Title A-Z</option>
+        <option value="artist-asc">Artist A-Z</option>
+        <option value="order-asc">Custom order (drag to arrange)</option>
+      </select>
+      <button id="addAlbumBtn" class="primary-btn">+ Add Album</button>
+      <button id="forYouBtn" title="Get recommendations based on your ratings">💡 For You</button>
+      <a href="explore.html" class="btn-link" title="Browse the rock influence map">🌳 Explore</a>
+      <button id="statsBtn" title="See listening stats">📊 Stats</button>
+      <button id="exportBtn" title="Download a backup of your library">Export</button>
+      <button id="importBtn" title="Restore from a backup file">Import</button>
+      <input id="importFile" type="file" accept="application/json" hidden>
+    </div>
+  </header>
+
+  <div id="activeFilterChip" class="active-filter-chip" hidden>
+    <span id="activeFilterText"></span>
+    <button id="clearFilterBtn" type="button">✕</button>
+  </div>
+
+  <p id="customOrderHint" class="custom-order-hint" hidden></p>
+
+  <div id="bulkActionBar" class="bulk-action-bar" hidden>
+    <span id="bulkSelectedCount">0 selected</span>
+    <select id="bulkFolderSelect">
+      <option value="">Add to folder...</option>
+    </select>
+    <button id="bulkAddToFolderBtn" type="button">Add to Folder</button>
+    <button id="bulkDeleteBtn" type="button" class="danger-btn">Delete Selected</button>
+    <div class="footer-spacer"></div>
+    <button id="bulkCancelBtn" type="button">Cancel</button>
+  </div>
+
+  <main id="library" class="library-grid"></main>
+  <p id="emptyState" class="empty-state" hidden>No albums yet. Click "+ Add Album" to log your first one.</p>
+
+  <!-- Add / Edit Modal -->
+  <div id="albumModal" class="modal-overlay" hidden>
+    <div class="modal">
+      <button class="modal-close" id="closeModalBtn">&times;</button>
+      <h2 id="modalTitle">Add Album</h2>
+
+      <div class="modal-body">
+        <div class="modal-left">
+          <div class="cover-preview">
+            <img id="coverPreview" src="" alt="Album cover" hidden>
+            <div id="coverPlaceholder" class="cover-placeholder">No cover yet</div>
+          </div>
+
+          <label>Artist
+            <input id="artistInput" type="text" placeholder="e.g. Radiohead">
+          </label>
+          <label>Album Title
+            <input id="titleInput" type="text" placeholder="e.g. In Rainbows">
+          </label>
+          <p class="hint" style="margin:-4px 0 4px;">Type an album (and/or artist) and pause — matches appear automatically. Press Enter to search right away.</p>
+          <a id="spotifyLink" class="spotify-btn disabled" href="#" target="_blank" rel="noopener noreferrer">🎧 Open in Spotify</a>
+          <button id="autofillBtn" type="button">🔍 Search &amp; Auto-fill</button>
+          <p id="autofillStatus" class="status-text"></p>
+          <div id="candidateList" class="candidate-list"></div>
+
+          <label>Year
+            <input id="yearInput" type="text" placeholder="e.g. 2007">
+          </label>
+          <label for="genreInput">Genre tags
+            <div class="chip-input" id="genreChips">
+              <input id="genreInput" type="text" placeholder="Type a genre, press Enter" list="genreSuggestions">
+            </div>
+            <datalist id="genreSuggestions"></datalist>
+          </label>
+          <label for="tagInput">Tags
+            <div class="quick-tags" id="quickTags"></div>
+            <div class="chip-input" id="tagChips">
+              <input id="tagInput" type="text" placeholder="Add your own tag, press Enter" list="tagSuggestions">
+            </div>
+            <datalist id="tagSuggestions"></datalist>
+          </label>
+          <label for="folderCheckboxList">Folders
+            <div id="folderCheckboxList" class="folder-checkbox-list"></div>
+          </label>
+
+          <label for="ratingStars">Rating
+            <div class="rating-row">
+              <div id="ratingStars" class="half-star-rating" role="slider" tabindex="0" aria-label="Rating" aria-valuemin="0" aria-valuemax="5"></div>
+              <span id="ratingValue" class="rating-value"></span>
+            </div>
+            <div class="rating-actions">
+              <button id="ratingZeroBtn" type="button">0★</button>
+              <button id="ratingClearBtn" type="button">Clear rating</button>
+            </div>
+          </label>
+
+          <label for="timesListenedInput">Times Listened
+            <div class="counter">
+              <button id="decrementBtn" type="button">−</button>
+              <input id="timesListenedInput" type="number" min="0" value="0">
+              <button id="incrementBtn" type="button">+</button>
+            </div>
+            <p id="lastListenedText" class="hint" style="margin:6px 0 0;"></p>
+          </label>
+
+          <div class="field-pair">
+            <label>First listened
+              <input id="firstListenedInput" type="date">
+            </label>
+            <label>Format
+              <select id="formatInput">
+                <option value="">—</option>
+                <option>Streaming</option>
+                <option>Vinyl</option>
+                <option>CD</option>
+                <option>Cassette</option>
+                <option>Digital download</option>
+                <option>Radio / Live</option>
+              </select>
+            </label>
+          </div>
+          <label>Recommended by / where I heard it
+            <input id="recommendedByInput" type="text" placeholder="e.g. a friend, a podcast, a playlist">
+          </label>
+
+          <label>Notes / Review
+            <textarea id="notesInput" rows="4" placeholder="Thoughts on this album..."></textarea>
+          </label>
+
+          <div id="ratingHistorySection" hidden>
+            <label>Rating History</label>
+            <ul id="ratingHistoryList" class="rating-history-list"></ul>
+          </div>
+        </div>
+
+        <div class="modal-right">
+          <h3>Tracklist</h3>
+          <p class="hint">Click ♥ to mark a favorite track, 👎 to mark a least-favorite. Add tracks manually if auto-fill didn't find them.</p>
+          <ul id="trackList" class="track-list"></ul>
+          <div id="trackSummary" class="track-summary"></div>
+          <div class="add-track-row">
+            <input id="newTrackInput" type="text" placeholder="Add a track manually...">
+            <button id="addTrackBtn" type="button">Add</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button id="deleteAlbumBtn" class="danger-btn" hidden>Delete Album</button>
+        <div class="footer-spacer"></div>
+        <button id="cancelBtn">Cancel</button>
+        <button id="saveAlbumBtn" class="primary-btn">Save Album</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Folders Modal -->
+  <div id="foldersModal" class="modal-overlay" hidden>
+    <div class="modal modal-small">
+      <button class="modal-close" id="closeFoldersBtn">&times;</button>
+      <h2>Folders</h2>
+      <div class="add-folder-row">
+        <input id="newFolderIcon" type="text" maxlength="2" placeholder="📁" class="folder-icon-input">
+        <input id="newFolderInput" type="text" placeholder="New folder name...">
+        <input id="newFolderColor" type="color" value="#7c9cff" class="folder-color-input" title="Folder color">
+        <button id="addFolderBtn" type="button">Add</button>
+      </div>
+      <ul id="foldersList" class="folders-list"></ul>
+    </div>
+  </div>
+
+  <!-- Stats Modal -->
+  <div id="statsModal" class="modal-overlay" hidden>
+    <div class="modal">
+      <button class="modal-close" id="closeStatsBtn">&times;</button>
+      <h2>Your Listening Stats</h2>
+      <div id="statsBody" class="stats-body"></div>
+    </div>
+  </div>
+
+  <!-- For You (Recommendations) Modal -->
+  <div id="forYouModal" class="modal-overlay" hidden>
+    <div class="modal">
+      <button class="modal-close" id="closeForYouBtn">&times;</button>
+      <h2>Recommended For You</h2>
+      <div class="for-you-header-row">
+        <p class="hint" style="margin:0;">Based on artists you rated 4★ or higher. A curated influence map runs for free; adding a Last.fm key layers on a second opinion for every rated artist — when both agree you get one combined card, when they don't you get both picks.</p>
+        <button id="lastfmSettingsBtn" type="button">⚙ Last.fm Key</button>
+      </div>
+      <div id="forYouBody" class="stats-body"></div>
+    </div>
+  </div>
+
+  <!-- Last.fm Settings Modal -->
+  <div id="lastfmModal" class="modal-overlay" hidden>
+    <div class="modal modal-small">
+      <button class="modal-close" id="closeLastfmBtn">&times;</button>
+      <h2>Last.fm Recommendations</h2>
+      <p class="hint">Optional: add a free Last.fm API key to get a second opinion on every rated artist, covering any genre — not just rock/punk/metal/indie. Where it agrees with the influence map you get one combined card; where it doesn't, you get both suggestions. <a href="https://www.last.fm/api/account/create" target="_blank" rel="noopener noreferrer">Get a free key →</a></p>
+      <label>API Key
+        <input id="lastfmKeyInput" type="text" placeholder="Paste your Last.fm API key">
+      </label>
+      <div class="modal-footer">
+        <button id="clearLastfmKeyBtn" class="danger-btn" type="button">Remove Key</button>
+        <div class="footer-spacer"></div>
+        <button id="saveLastfmKeyBtn" class="primary-btn" type="button">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="influence-data.js"></script>
+  <script src="app.js?v=4"></script>
+</body>
+</html>
