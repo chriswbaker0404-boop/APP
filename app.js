@@ -4,7 +4,8 @@ const STORAGE_KEY = "albumTracker.library.v1";
 function loadLibrary() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    const parsed = raw ? JSON.parse(raw) : [];
+    // First run of a build with your albums baked in: start from those.
+    const parsed = raw ? JSON.parse(raw) : backupAlbums(window.EMBEDDED_BACKUP);
     return parsed.map(normalizeAlbum);
   } catch (e) {
     console.error("Failed to load library", e);
@@ -97,7 +98,7 @@ const DEFAULT_FOLDER_COLOR = "#7c9cff";
 function loadFolders() {
   try {
     const raw = localStorage.getItem(FOLDERS_KEY);
-    const parsed = raw ? JSON.parse(raw) : [];
+    const parsed = raw ? JSON.parse(raw) : backupFolders(window.EMBEDDED_BACKUP);
     // Backfill icon/color for folders created before those existed.
     return parsed.map((f) => ({
       icon: f.icon || "📁",
@@ -114,8 +115,37 @@ function saveFolders() {
   localStorage.setItem(FOLDERS_KEY, JSON.stringify(folders));
 }
 
+// Backups are either the old format (just an array of albums) or
+// { albums: [...], folders: [...] }.
+function backupAlbums(data) {
+  if (Array.isArray(data)) return data;
+  return data && Array.isArray(data.albums) ? data.albums : [];
+}
+function backupFolders(data) {
+  return data && !Array.isArray(data) && Array.isArray(data.folders) ? data.folders : [];
+}
+
+// Old backups didn't include folders. If albums point at folders we don't
+// know about, recreate them as "Folder 1", "Folder 2"... so the grouping
+// survives and they can just be renamed.
+function ensureFoldersExist() {
+  const known = new Set(folders.map((f) => f.id));
+  let added = false;
+  library.forEach((a) =>
+    (a.folderIds || []).forEach((id) => {
+      if (known.has(id)) return;
+      known.add(id);
+      folders.push({ id, name: `Folder ${folders.length + 1}`, icon: "📁", color: DEFAULT_FOLDER_COLOR });
+      added = true;
+    })
+  );
+  return added;
+}
+
 let library = loadLibrary();
 let folders = loadFolders();
+if (!localStorage.getItem(STORAGE_KEY) && library.length) saveLibrary();
+if (ensureFoldersExist() || (!localStorage.getItem(FOLDERS_KEY) && folders.length)) saveFolders();
 let editingId = null; // null = adding new album
 let currentTracks = []; // working tracklist while modal is open
 
@@ -1871,7 +1901,8 @@ async function selectCandidate(candidate) {
 
 // ---------- Export / Import ----------
 document.getElementById("exportBtn").addEventListener("click", () => {
-  const blob = new Blob([JSON.stringify(library, null, 2)], { type: "application/json" });
+  const backup = { app: "album-tracker", version: 2, exported: new Date().toISOString(), albums: library, folders };
+  const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -1889,11 +1920,15 @@ importFileInput.addEventListener("change", () => {
   reader.onload = () => {
     try {
       const data = JSON.parse(reader.result);
-      if (!Array.isArray(data)) throw new Error("Invalid file format");
+      if (!Array.isArray(data) && !(data && Array.isArray(data.albums))) throw new Error("Invalid file format");
       const merge = confirm(
         "Click OK to merge this backup into your current library, or Cancel to replace your current library entirely."
       );
-      const incoming = data.map(normalizeAlbum);
+      const incoming = backupAlbums(data).map(normalizeAlbum);
+      const incomingFolders = backupFolders(data);
+      const folderById = new Map((merge ? folders : []).map((f) => [f.id, f]));
+      incomingFolders.forEach((f) => folderById.set(f.id, { icon: "📁", color: DEFAULT_FOLDER_COLOR, ...f }));
+      folders = [...folderById.values()];
       if (merge) {
         // Same album id in both = the backup's copy wins, instead of a duplicate.
         const byId = new Map(library.map((a) => [a.id, a]));
@@ -1902,7 +1937,10 @@ importFileInput.addEventListener("change", () => {
       } else {
         library = incoming;
       }
+      ensureFoldersExist();
       saveLibrary();
+      saveFolders();
+      renderFolderFilterOptions();
       renderTagFilterOptions();
       renderLibrary();
       alert("Import complete.");
@@ -2449,6 +2487,17 @@ tagFilterEl.addEventListener("change", () => {
 renderFolderFilterOptions();
 renderTagFilterOptions();
 renderLibrary();
+
+function startAddingArtist(addArtist) {
+  openModal(null);
+  artistInput.value = addArtist;
+  titleInput.value = "";
+  updateSpotifyLink();
+  autofillSearch();
+}
+// Used by the Explore map when it's shown inside this page.
+window.__albumTrackerLibrary = () => library;
+window.__albumTrackerAddArtist = startAddingArtist;
 
 // Deep link from explore.html's "+ Add to library" links (?addArtist=Name)
 (function handleAddArtistParam() {
