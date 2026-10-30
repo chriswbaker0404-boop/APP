@@ -39,7 +39,20 @@ function normalizeAlbum(a, idx) {
   }
   migrated.genre = migrated.genres.join(", ");
   if (!Array.isArray(migrated.tags)) migrated.tags = [];
+  // Producers / record labels: lists of { name, id } (id = MusicBrainz id, or "" if typed by hand).
+  migrated.producers = normalizeCredits(migrated.producers);
+  migrated.labels = normalizeCredits(migrated.labels);
   return migrated;
+}
+
+function normalizeCredits(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((c) => (typeof c === "string" ? { name: c, id: "" } : c && c.name ? { name: String(c.name), id: c.id || "" } : null))
+    .filter(Boolean);
+}
+function creditNames(list) {
+  return (list || []).map((c) => (typeof c === "string" ? c : c && c.name)).filter(Boolean);
 }
 
 function saveLibrary() {
@@ -243,10 +256,20 @@ const recommendedByInput = document.getElementById("recommendedByInput");
 const firstListenedInput = document.getElementById("firstListenedInput");
 const trackSummaryEl = document.getElementById("trackSummary");
 const customOrderHintEl = document.getElementById("customOrderHint");
+const producerChipsEl = document.getElementById("producerChips");
+const producerInput = document.getElementById("producerInput");
+const labelChipsEl = document.getElementById("labelChips");
+const labelInput = document.getElementById("labelInput");
+const creditsStatusEl = document.getElementById("creditsStatus");
+const creditsBannerEl = document.getElementById("creditsBanner");
 
 let currentRating = null;
 let currentGenres = [];
 let genreWasAutoFilled = false; // true while the genre chips came from a search pick
+let currentProducers = []; // [{ name, id }]
+let currentLabels = [];
+let creditsWereAutoFilled = false; // same idea as genreWasAutoFilled
+let currentMbReleaseGroupId = null;
 let currentTags = [];
 let currentCoverUrl = "";
 let selectMode = false;
@@ -279,7 +302,7 @@ function renderLibrary() {
 
   let items = folderScoped.filter((a) => {
     if (!query) return true;
-    return [a.title, a.artist, ...(a.genres || []), ...(a.tags || []), a.recommendedBy]
+    return [a.title, a.artist, ...(a.genres || []), ...(a.tags || []), ...creditNames(a.producers), ...creditNames(a.labels), a.recommendedBy]
       .some((field) => (field || "").toLowerCase().includes(query));
   });
 
@@ -688,10 +711,11 @@ document.getElementById("ratingZeroBtn").addEventListener("click", () => setRati
 document.getElementById("ratingClearBtn").addEventListener("click", () => setRating(null));
 
 // ---------- Genre + tag chip inputs ----------
+// field: "genres" | "tags" | "producers" | "labels"
 function allUsedTags(field) {
   const counts = new Map();
   library.forEach((a) =>
-    (a[field] || []).forEach((t) => {
+    creditNames(a[field]).forEach((t) => {
       const key = t.toLowerCase();
       const entry = counts.get(key) || { name: t, count: 0 };
       entry.count++;
@@ -705,8 +729,8 @@ function albumHasTag(album, filterValue) {
   const sep = filterValue.indexOf(":");
   const kind = filterValue.slice(0, sep);
   const name = filterValue.slice(sep + 1);
-  const list = kind === "genre" ? album.genres : album.tags;
-  return (list || []).some((t) => t.toLowerCase() === name);
+  const field = { genre: "genres", tag: "tags", producer: "producers", label: "labels" }[kind] || "tags";
+  return creditNames(album[field]).some((t) => t.toLowerCase() === name);
 }
 
 function renderChips(container, input, list, className, onRemove) {
@@ -800,14 +824,130 @@ function refreshTagSuggestions() {
     .filter((t) => !QUICK_TAGS.includes(t.name.toLowerCase()))
     .map((t) => `<option value="${escapeAttr(t.name)}">`)
     .join("");
+  ["producer", "label"].forEach((kind) => {
+    document.getElementById(kind + "Suggestions").innerHTML = allUsedTags(kind + "s")
+      .map((t) => `<option value="${escapeAttr(t.name)}">`)
+      .join("");
+  });
 }
+
+// ---------- Producer + label chip inputs ----------
+function addCredit(list, name, id) {
+  const clean = (name || "").trim().replace(/\s+/g, " ");
+  if (!clean || list.some((c) => c.name.toLowerCase() === clean.toLowerCase())) return list;
+  return [...list, { name: clean, id: id || "" }];
+}
+
+function renderCreditChips() {
+  renderChips(producerChipsEl, producerInput, creditNames(currentProducers), "producer", (idx) => {
+    currentProducers.splice(idx, 1);
+    creditsWereAutoFilled = false;
+    renderCreditChips();
+  });
+  renderChips(labelChipsEl, labelInput, creditNames(currentLabels), "label", (idx) => {
+    currentLabels.splice(idx, 1);
+    creditsWereAutoFilled = false;
+    renderCreditChips();
+  });
+}
+
+function commitCreditInput(input) {
+  const parts = splitTags(input.value);
+  if (!parts.length) return;
+  parts.forEach((p) => {
+    if (input === producerInput) currentProducers = addCredit(currentProducers, p);
+    else currentLabels = addCredit(currentLabels, p);
+  });
+  creditsWereAutoFilled = false;
+  input.value = "";
+  renderCreditChips();
+}
+
+[producerInput, labelInput].forEach((input) => {
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === ",") {
+      e.preventDefault();
+      commitCreditInput(input);
+    } else if (e.key === "Backspace" && !input.value) {
+      const list = input === producerInput ? currentProducers : currentLabels;
+      if (list.length) {
+        list.pop();
+        renderCreditChips();
+      }
+    }
+  });
+  input.addEventListener("change", () => commitCreditInput(input));
+  input.addEventListener("blur", () => commitCreditInput(input));
+});
+
+// Fills producers/labels from MusicBrainz. Replaces ones a previous search
+// pick filled in, but never anything you typed yourself (only adds to those).
+function applyCredits(credits) {
+  const replace = creditsWereAutoFilled || (!currentProducers.length && !currentLabels.length);
+  const base = (list) => (replace ? [] : list);
+  let producers = base(currentProducers);
+  let labels = base(currentLabels);
+  credits.producers.forEach((c) => (producers = addCredit(producers, c.name, c.id)));
+  credits.labels.forEach((c) => (labels = addCredit(labels, c.name, c.id)));
+  currentProducers = producers;
+  currentLabels = labels;
+  creditsWereAutoFilled = replace;
+  renderCreditChips();
+}
+
+function describeCredits(credits) {
+  const parts = [];
+  if (credits.producers.length) parts.push(`produced by ${creditNames(credits.producers).slice(0, 3).join(", ")}`);
+  if (credits.labels.length) parts.push(`on ${creditNames(credits.labels).slice(0, 2).join(", ")}`);
+  return parts.join(", ");
+}
+
+document.getElementById("lookupCreditsBtn").addEventListener("click", async () => {
+  const artist = artistInput.value.trim();
+  const title = titleInput.value.trim();
+  if (!artist || !title) {
+    creditsStatusEl.textContent = "Fill in the artist and album title first.";
+    return;
+  }
+  const seq = searchSeq;
+  creditsStatusEl.textContent = "Looking up producers & labels on MusicBrainz...";
+  try {
+    let rgId = currentMbReleaseGroupId;
+    if (!rgId) {
+      const rg = await findMbReleaseGroup(artist, title);
+      rgId = rg && rg.id;
+    }
+    if (!rgId) {
+      creditsStatusEl.textContent = "Couldn't find this album on MusicBrainz. You can type producers and labels in yourself.";
+      return;
+    }
+    const credits = await fetchMbCredits(rgId);
+    if (seq !== searchSeq || modal.hidden) return;
+    currentMbReleaseGroupId = rgId;
+    if (!credits.producers.length && !credits.labels.length) {
+      creditsStatusEl.textContent = "MusicBrainz has no producer or label info for this album yet.";
+      return;
+    }
+    applyCredits(credits);
+    creditsStatusEl.textContent = `Found: ${describeCredits(credits)}.`;
+  } catch (err) {
+    console.error(err);
+    creditsStatusEl.textContent = "Couldn't reach MusicBrainz. Check your internet connection and try again.";
+  }
+});
 
 function renderTagFilterOptions() {
   const prev = tagFilterEl.value;
   const genres = allUsedTags("genres");
   const tags = allUsedTags("tags");
+  const group = (label, kind, items) =>
+    items.length
+      ? `<optgroup label="${label}">${items
+          .map((t) => `<option value="${kind}:${escapeAttr(t.name.toLowerCase())}">${escapeHtml(t.name)} (${t.count})</option>`)
+          .join("")}</optgroup>`
+      : "";
   tagFilterEl.innerHTML =
-    `<option value="">All genres &amp; tags</option>` +
+    `<option value="">All genres, tags &amp; credits</option>` +
     (genres.length
       ? `<optgroup label="Genres">${genres
           .map((g) => `<option value="genre:${escapeAttr(g.name.toLowerCase())}">${escapeHtml(g.name)} (${g.count})</option>`)
@@ -817,7 +957,9 @@ function renderTagFilterOptions() {
       ? `<optgroup label="Tags">${tags
           .map((t) => `<option value="tag:${escapeAttr(t.name.toLowerCase())}">${escapeHtml(t.name)} (${t.count})</option>`)
           .join("")}</optgroup>`
-      : "");
+      : "") +
+    group("Producers", "producer", allUsedTags("producers")) +
+    group("Record labels", "label", allUsedTags("labels"));
   tagFilterEl.value = [...tagFilterEl.options].some((o) => o.value === prev) ? prev : "";
 }
 
@@ -915,6 +1057,13 @@ function openModal(id) {
   tagInput.value = "";
   currentGenres = [...(album?.genres || [])];
   genreWasAutoFilled = false;
+  currentProducers = normalizeCredits(album?.producers);
+  currentLabels = normalizeCredits(album?.labels);
+  creditsWereAutoFilled = false;
+  currentMbReleaseGroupId = album?.mbReleaseGroupId || null;
+  producerInput.value = "";
+  labelInput.value = "";
+  creditsStatusEl.textContent = "";
   currentTags = [...(album?.tags || [])];
   formatInput.value = album?.format || "";
   recommendedByInput.value = album?.recommendedBy || "";
@@ -937,6 +1086,7 @@ function openModal(id) {
   renderStars();
   renderGenreChips();
   renderTagChips();
+  renderCreditChips();
   refreshTagSuggestions();
   renderTrackList();
   renderRatingHistory(album);
@@ -1018,6 +1168,8 @@ document.getElementById("saveAlbumBtn").addEventListener("click", () => {
   // Anything still typed in the tag boxes counts, even without pressing Enter.
   commitChipInput(genreInput, "genre");
   commitChipInput(tagInput, "tag");
+  commitCreditInput(producerInput);
+  commitCreditInput(labelInput);
 
   const prevAlbum = editingId ? library.find((a) => a.id === editingId) : null;
   const prevHistory = prevAlbum?.ratingHistory || [];
@@ -1040,6 +1192,10 @@ document.getElementById("saveAlbumBtn").addEventListener("click", () => {
     genres: currentGenres,
     genre: currentGenres.join(", "),
     tags: currentTags,
+    producers: currentProducers,
+    labels: currentLabels,
+    mbReleaseGroupId: currentMbReleaseGroupId,
+    creditsChecked: currentMbReleaseGroupId ? prevAlbum?.creditsChecked || new Date().toISOString() : prevAlbum?.creditsChecked || null,
     format: formatInput.value,
     recommendedBy: recommendedByInput.value.trim(),
     firstListened: firstListenedInput.value || null,
@@ -1464,6 +1620,33 @@ async function searchItunes(artist, title) {
 }
 
 const MB_TYPE_RANK = { Album: 0, EP: 1, Single: 2, Broadcast: 4, Other: 4 };
+const MB_API = "https://musicbrainz.org/ws/2/";
+
+// MusicBrainz allows about one request per second and answers 503 when you go
+// faster, which matters now that picking an album also looks up its credits
+// and "Fill them in" walks the whole library. All MusicBrainz requests go
+// through this queue, spaced just over a second apart, with one retry on 503.
+let mbQueue = Promise.resolve();
+let mbLastRequest = 0;
+function mbFetch(url) {
+  const run = mbQueue.then(async () => {
+    for (let attempt = 0; ; attempt++) {
+      const wait = mbLastRequest + (window.__mbSpacingMs ?? 1100) - Date.now(); // override only used by tests
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      mbLastRequest = Date.now();
+      const res = await fetch(url);
+      if (res.status !== 503 || attempt >= 1) return res;
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  });
+  mbQueue = run.catch(() => {});
+  return run;
+}
+async function mbJson(path) {
+  const res = await mbFetch(MB_API + path);
+  if (!res.ok) throw new Error(`MusicBrainz request failed (${res.status})`);
+  return res.json();
+}
 
 async function searchMusicBrainz(artist, title) {
   const cleanTitle = title.replace(/"/g, "");
@@ -1478,7 +1661,7 @@ async function searchMusicBrainz(artist, title) {
   // re-rank client-side by signals that correlate with "well-known release" —
   // how many pressings/editions exist (a popularity proxy), then community tagging.
   const url = `https://musicbrainz.org/ws/2/release-group/?query=${encodeURIComponent(query)}&fmt=json&limit=25`;
-  const res = await fetch(url);
+  const res = await mbFetch(url);
   if (!res.ok) throw new Error("MusicBrainz search failed");
   const data = await res.json();
   const results = data["release-groups"] || [];
@@ -1501,9 +1684,26 @@ async function searchMusicBrainz(artist, title) {
 }
 
 async function fetchMusicBrainzTracklist(releaseGroupId) {
+  return (await fetchMbOriginalRelease(releaseGroupId)).tracks;
+}
+
+// The release group's original studio release: { id, tracks }. Remembered per
+// release group, since picking an album asks for it for both the tracklist
+// and the credits.
+const mbOriginalReleaseCache = new Map();
+function fetchMbOriginalRelease(releaseGroupId) {
+  if (!mbOriginalReleaseCache.has(releaseGroupId)) {
+    const p = loadMbOriginalRelease(releaseGroupId);
+    mbOriginalReleaseCache.set(releaseGroupId, p);
+    p.catch(() => mbOriginalReleaseCache.delete(releaseGroupId));
+  }
+  return mbOriginalReleaseCache.get(releaseGroupId);
+}
+
+async function loadMbOriginalRelease(releaseGroupId) {
   const url = `https://musicbrainz.org/ws/2/release?release-group=${releaseGroupId}&inc=recordings&fmt=json&limit=15`;
-  const res = await fetch(url);
-  if (!res.ok) return [];
+  const res = await mbFetch(url);
+  if (!res.ok) return { id: null, tracks: [] };
   const data = await res.json();
   // A release group holds every pressing of the album: the original, plus
   // deluxe/remaster/anniversary reissues with bonus discs. Use the original
@@ -1515,6 +1715,7 @@ async function fetchMusicBrainzTracklist(releaseGroupId) {
       (release.media || []).forEach((medium) => (medium.tracks || []).forEach((t) => tracks.push(t.title)));
       const editionText = `${release.title || ""} ${release.disambiguation || ""}`;
       return {
+        id: release.id,
         tracks,
         official: release.status === "Official" ? 0 : 1,
         edition: STRONG_EDITION_RE.test(editionText) || EDITION_WORDS.test(release.disambiguation || "") ? 1 : 0,
@@ -1523,7 +1724,60 @@ async function fetchMusicBrainzTracklist(releaseGroupId) {
     })
     .filter((r) => r.tracks.length > 0)
     .sort((a, b) => a.edition - b.edition || a.official - b.official || a.date.localeCompare(b.date));
-  return releases.length ? releases[0].tracks : [];
+  return releases.length ? { id: releases[0].id, tracks: releases[0].tracks } : { id: null, tracks: [] };
+}
+
+// ---------- Credits: producers + record labels (MusicBrainz) ----------
+// Read from the album's original release. Producers credited on the whole
+// release count most; producers credited on individual tracks are added
+// after them, most tracks first. Executive producers are left out.
+function creditsFromRelease(release) {
+  const producers = new Map();
+  const addProducer = (rel, weight) => {
+    if (!rel || rel.type !== "producer" || !rel.artist || !rel.artist.name) return;
+    if ((rel.attributes || []).some((a) => /executive/i.test(String(a)))) return;
+    const key = rel.artist.id || rel.artist.name.toLowerCase();
+    const entry = producers.get(key) || { name: rel.artist.name, id: rel.artist.id || "", weight: 0 };
+    entry.weight += weight;
+    producers.set(key, entry);
+  };
+  (release.relations || []).forEach((rel) => addProducer(rel, 1000));
+  (release.media || []).forEach((medium) =>
+    (medium.tracks || []).forEach((track) => ((track.recording && track.recording.relations) || []).forEach((rel) => addProducer(rel, 1)))
+  );
+
+  const labels = [];
+  (release["label-info"] || []).forEach((info) => {
+    const label = info && info.label;
+    if (!label || !label.name || /^\[no label\]$/i.test(label.name)) return;
+    if (labels.some((l) => (l.id && l.id === label.id) || l.name.toLowerCase() === label.name.toLowerCase())) return;
+    labels.push({ name: label.name, id: label.id || "" });
+  });
+
+  return {
+    producers: [...producers.values()].sort((a, b) => b.weight - a.weight).slice(0, 8).map(({ name, id }) => ({ name, id })),
+    labels,
+  };
+}
+
+async function fetchMbCredits(releaseGroupId) {
+  const original = await fetchMbOriginalRelease(releaseGroupId);
+  if (!original.id) return { producers: [], labels: [] };
+  const release = await mbJson(`release/${original.id}?inc=labels+artist-rels+recordings+recording-level-rels&fmt=json`);
+  return creditsFromRelease(release);
+}
+
+// Finds an album already in the library on MusicBrainz: { id, tags } of its
+// release group, or null.
+async function findMbReleaseGroup(artist, title) {
+  const wanted = normText(baseTitle(title));
+  const results = await searchMusicBrainz(artist, baseTitle(title));
+  const artistOk = (rg) =>
+    textSimilarity(normText((rg["artist-credit"] || []).map((c) => c.name + (c.joinphrase || "")).join("")), normText(artist)) > 0.7;
+  const match =
+    results.find((rg) => normText(baseTitle(rg.title)) === wanted && artistOk(rg)) ||
+    results.find((rg) => textSimilarity(normText(baseTitle(rg.title)), wanted) > 0.85 && artistOk(rg));
+  return match ? { id: match.id, tags: match.tags } : null;
 }
 
 async function fetchItunesTracklist(collectionId) {
@@ -1551,7 +1805,7 @@ async function fetchTracklistFallback(candidate) {
     if (candidate.source === "itunes") {
       const mbResults = await searchMusicBrainz(candidate.artist, baseTitle(candidate.title));
       const match = mbResults.find((rg) => sameAlbum(rg.title)) || mbResults[0];
-      if (match) return { tracks: await fetchMusicBrainzTracklist(match.id), genre: mbTagsToGenre(match.tags) };
+      if (match) return { tracks: await fetchMusicBrainzTracklist(match.id), genre: mbTagsToGenre(match.tags), rgId: sameAlbum(match.title) ? match.id : null };
     } else {
       const itunesResults = await searchItunes(candidate.artist, candidate.title);
       // Prefer the plain studio release over a deluxe one with the same name.
@@ -1569,7 +1823,7 @@ async function fetchTracklistFallback(candidate) {
 
 async function searchMusicBrainzByArtist(artist) {
   const cleanArtist = artist.replace(/"/g, "");
-  const artistRes = await fetch(
+  const artistRes = await mbFetch(
     `https://musicbrainz.org/ws/2/artist/?query=${encodeURIComponent(`artist:"${cleanArtist}"`)}&fmt=json&limit=1`
   );
   if (!artistRes.ok) throw new Error("MusicBrainz artist search failed");
@@ -1577,7 +1831,7 @@ async function searchMusicBrainzByArtist(artist) {
   const bestArtist = (artistData.artists || [])[0];
   if (!bestArtist) return [];
 
-  const rgRes = await fetch(
+  const rgRes = await mbFetch(
     `https://musicbrainz.org/ws/2/release-group?artist=${bestArtist.id}&type=album&fmt=json&limit=50`
   );
   if (!rgRes.ok) throw new Error("MusicBrainz discography browse failed");
@@ -1848,6 +2102,7 @@ async function selectCandidate(candidate) {
     renderGenreChips();
   };
   fillGenre(candidate.genre);
+  currentMbReleaseGroupId = candidate.source === "musicbrainz" ? candidate.raw : null;
   currentCoverUrl = candidate.coverUrl || "";
   coverPlaceholder.textContent = "No cover yet";
   updateCoverPreview();
@@ -1885,13 +2140,37 @@ async function selectCandidate(candidate) {
       }
     }
 
+    let loadedMsg;
     if (trackNames.length > 0) {
       currentTracks = trackNames.map((name) => ({ name, favorite: false, least: false }));
       renderTrackList();
       const sourceNote = usedOther ? ` (via ${otherSourceName})` : "";
-      autofillStatus.textContent = `Loaded "${candidate.title}" by ${candidate.artist} — ${trackNames.length} tracks${sourceNote}.`;
+      loadedMsg = `Loaded "${candidate.title}" by ${candidate.artist} — ${trackNames.length} tracks${sourceNote}.`;
     } else {
-      autofillStatus.textContent = `Loaded "${candidate.title}" but couldn't find a tracklist on either source. Add tracks manually.`;
+      loadedMsg = `Loaded "${candidate.title}" but couldn't find a tracklist on either source. Add tracks manually.`;
+    }
+    autofillStatus.textContent = loadedMsg;
+
+    // Producers + labels, from the same MusicBrainz release group.
+    const rgId = candidate.source === "musicbrainz" ? candidate.raw : other.rgId;
+    if (rgId) {
+      currentMbReleaseGroupId = rgId;
+      creditsStatusEl.textContent = "Looking up producers & labels...";
+      try {
+        const credits = await fetchMbCredits(rgId);
+        if (seq !== searchSeq) return;
+        if (credits.producers.length || credits.labels.length) {
+          applyCredits(credits);
+          creditsStatusEl.textContent = `Found: ${describeCredits(credits)}.`;
+        } else {
+          creditsStatusEl.textContent = "MusicBrainz has no producer or label info for this album yet.";
+        }
+      } catch (err) {
+        console.error(err);
+        if (seq === searchSeq) creditsStatusEl.textContent = "Couldn't load producers & labels. Try the Look up button.";
+      }
+    } else {
+      creditsStatusEl.textContent = "Couldn't match this album on MusicBrainz for producers & labels. Try the Look up button.";
     }
   } catch (err) {
     console.error(err);
@@ -2018,21 +2297,21 @@ function computeStats() {
   return { totalAlbums, totalListens, avgRating, mostListened, distribution, artistStats, genreStats };
 }
 
-function renderTagStats() {
-  const tags = allUsedTags("tags");
+function renderTagStats(field = "tags", heading = "By tag", column = "Tag", limit = Infinity) {
+  const tags = allUsedTags(field).slice(0, limit);
   if (!tags.length) return "";
   const rows = tags
     .map((t) => {
-      const albums = library.filter((a) => (a.tags || []).some((x) => x.toLowerCase() === t.name.toLowerCase()));
+      const albums = library.filter((a) => creditNames(a[field]).some((x) => x.toLowerCase() === t.name.toLowerCase()));
       const rated = albums.filter(isRated);
       const avg = rated.length ? rated.reduce((s, a) => s + a.rating, 0) / rated.length : null;
       return `<tr><td>${escapeHtml(t.name)}</td><td>${albums.length}</td><td>${avg != null ? avg.toFixed(1) + " ★" : "—"}</td></tr>`;
     })
     .join("");
   return `
-    <h3>By tag</h3>
+    <h3>${heading}</h3>
     <table class="stats-table">
-      <thead><tr><th>Tag</th><th>Albums</th><th>Avg rating</th></tr></thead>
+      <thead><tr><th>${column}</th><th>Albums</th><th>Avg rating</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
 }
@@ -2174,6 +2453,8 @@ function openStatsModal() {
     </table>
 
     ${renderTagStats()}
+    ${renderTagStats("producers", "By producer", "Producer", 20)}
+    ${renderTagStats("labels", "By record label", "Label", 20)}
 
     <h3>By genre</h3>
     <table class="stats-table">
@@ -2348,25 +2629,283 @@ async function computeLastfmRecommendations() {
   };
 }
 
-// Combine the two sources: when both suggest the same artist, fold them into
-// one card (keeping the map's richer description/album pick, but noting both
-// agree). When they disagree, each source's pick stands on its own.
-function mergeRecommendations(mapRecs, lastfmRecs) {
+// Combine the sources: when several suggest the same artist, fold them into
+// one card (keeping the first card's description/album pick, plus any
+// producer/label note, and noting that they agree). When they disagree, each
+// source's pick stands on its own.
+function mergeRecommendations(mapRecs, lastfmRecs, creditRecs = []) {
   const merged = new Map();
-  mapRecs.forEach((r) => {
-    merged.set(normalizeArtistName(r.name), { ...r, sources: ["map"] });
-  });
-  lastfmRecs.forEach((r) => {
+  const add = (r, source) => {
     const key = normalizeArtistName(r.name);
-    if (merged.has(key)) {
-      const existing = merged.get(key);
-      existing.reasons = [...new Set([...existing.reasons, ...r.reasons])];
-      existing.sources = [...existing.sources, "lastfm"];
-    } else {
-      merged.set(key, { ...r, sources: ["lastfm"] });
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, { ...r, sources: [source], extraNotes: [] });
+      return;
     }
+    existing.reasons = [...new Set([...existing.reasons, ...r.reasons])];
+    if (!existing.sources.includes(source)) existing.sources.push(source);
+    if ((source === "producer" || source === "label") && r.note !== existing.note) existing.extraNotes.push(r.note);
+    if (!existing.albums.length) existing.albums = r.albums;
+  };
+  mapRecs.forEach((r) => add(r, "map"));
+  lastfmRecs.forEach((r) => add(r, "lastfm"));
+  creditRecs.forEach((r) => add(r, r.source));
+  return [...merged.values()].sort(
+    (a, b) => b.sources.length - a.sources.length || b.reasons.length - a.reasons.length
+  );
+}
+
+// ---------- Producer & label recommendations (MusicBrainz) ----------
+// Takes the producers and labels behind albums you rated 4★+, and finds other
+// well-known albums they made or released. "Well-known" = how many pressings
+// MusicBrainz lists for it, which tracks popularity surprisingly well.
+// Results are remembered for two weeks so this is quick after the first time.
+const CREDIT_RECS_CACHE_KEY = "albumTracker.creditRecs.v1";
+const CREDIT_RECS_CACHE_MS = 14 * 24 * 60 * 60 * 1000;
+const CREDIT_KINDS = { producer: "producers", label: "labels" };
+
+function loadCreditRecsCache() {
+  try {
+    return JSON.parse(localStorage.getItem(CREDIT_RECS_CACHE_KEY)) || {};
+  } catch (e) {
+    return {};
+  }
+}
+function saveCreditRecsCache(cache) {
+  try {
+    localStorage.setItem(CREDIT_RECS_CACHE_KEY, JSON.stringify(cache));
+  } catch (e) {}
+}
+
+function artistCreditName(credit) {
+  return (credit || []).map((c) => (c.name || (c.artist && c.artist.name) || "") + (c.joinphrase || "")).join("").trim();
+}
+
+// Producers or labels (with a MusicBrainz id) behind albums you rated 4★+,
+// most-loved first.
+function likedCredits(field) {
+  const map = new Map();
+  library
+    .filter((a) => isRated(a) && a.rating >= 4)
+    .forEach((a) =>
+      normalizeCredits(a[field]).forEach((c) => {
+        if (!c.id) return;
+        const entry = map.get(c.id) || { id: c.id, name: c.name, albums: [], ratingSum: 0 };
+        entry.albums.push(a);
+        entry.ratingSum += a.rating;
+        map.set(c.id, entry);
+      })
+    );
+  return [...map.values()].sort((x, y) => y.albums.length - x.albums.length || y.ratingSum - x.ratingSum);
+}
+
+const alreadyHaveTitle = (title) => library.some((a) => normText(baseTitle(a.title)) === normText(baseTitle(title)));
+
+async function fetchProducerPicks(producerId) {
+  const data = await mbJson(`artist/${producerId}?inc=release-rels&fmt=json`);
+  const groups = new Map();
+  (data.relations || []).forEach((rel) => {
+    if (rel.type !== "producer" || !rel.release || !rel.release.title) return;
+    if ((rel.attributes || []).some((a) => /executive/i.test(String(a)))) return;
+    const key = normText(baseTitle(rel.release.title));
+    const g = groups.get(key) || { title: baseTitle(rel.release.title), releaseId: rel.release.id, count: 0 };
+    g.count++;
+    groups.set(key, g);
   });
-  return [...merged.values()].sort((a, b) => b.reasons.length - a.reasons.length);
+  const picks = [];
+  for (const g of [...groups.values()].sort((a, b) => b.count - a.count).slice(0, 10)) {
+    if (picks.length >= 4) break;
+    if (alreadyHaveTitle(g.title)) continue;
+    try {
+      // The relationship list only has the title, so look up who made it.
+      const release = await mbJson(`release/${g.releaseId}?inc=artist-credits+release-groups&fmt=json`);
+      const artist = artistCreditName(release["artist-credit"]);
+      const rg = release["release-group"] || {};
+      if (!artist || /various artists/i.test(artist)) continue;
+      if ((rg["primary-type"] && rg["primary-type"] !== "Album") || (rg["secondary-types"] || []).length) continue;
+      picks.push({ artist, title: rg.title || g.title });
+    } catch (err) {
+      console.error(err);
+    }
+  }
+  return picks;
+}
+
+async function fetchLabelPicks(labelId) {
+  const data = await mbJson(`release?label=${labelId}&type=album&status=official&inc=artist-credits+release-groups&limit=100&fmt=json`);
+  const groups = new Map();
+  (data.releases || []).forEach((release) => {
+    const rg = release["release-group"] || {};
+    const artist = artistCreditName(release["artist-credit"]);
+    const title = rg.title || release.title;
+    if (!title || !artist || /various artists/i.test(artist)) return;
+    if ((rg["primary-type"] && rg["primary-type"] !== "Album") || (rg["secondary-types"] || []).length) return;
+    const key = rg.id || normText(artist) + "|" + normText(baseTitle(title));
+    const g = groups.get(key) || { artist, title, count: 0 };
+    g.count++;
+    groups.set(key, g);
+  });
+  return [...groups.values()]
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 8)
+    .map(({ artist, title }) => ({ artist, title }));
+}
+
+function listTitles(albums) {
+  const titles = [...new Set(albums.map((a) => a.title))];
+  if (titles.length <= 2) return titles.join(" and ");
+  return `${titles.slice(0, 2).join(", ")} and ${titles.length - 2} more`;
+}
+
+let creditRecsInFlight = null;
+function computeCreditRecommendations(onProgress) {
+  if (!creditRecsInFlight) {
+    creditRecsInFlight = buildCreditRecommendations(onProgress).finally(() => (creditRecsInFlight = null));
+  }
+  return creditRecsInFlight;
+}
+
+async function buildCreditRecommendations(onProgress) {
+  const cache = loadCreditRecsCache();
+  const recs = [];
+  const seenArtists = new Set(library.map((a) => normalizeArtistName(a.artist)));
+  for (const kind of ["producer", "label"]) {
+    for (const credit of likedCredits(CREDIT_KINDS[kind]).slice(0, 3)) {
+      const key = kind + ":" + credit.id;
+      let entry = cache[key];
+      if (!entry || Date.now() - entry.at > CREDIT_RECS_CACHE_MS) {
+        onProgress && onProgress(`Checking what else ${credit.name} ${kind === "producer" ? "produced" : "released"}...`);
+        try {
+          const picks = kind === "producer" ? await fetchProducerPicks(credit.id) : await fetchLabelPicks(credit.id);
+          entry = cache[key] = { at: Date.now(), picks };
+          saveCreditRecsCache(cache);
+        } catch (err) {
+          console.error(err);
+          continue;
+        }
+      }
+      // Prefer artists you haven't logged yet, and skip albums you already have.
+      const fresh = entry.picks.filter((p) => !findExistingAlbum(p.artist, p.title) && !alreadyHaveTitle(p.title));
+      fresh.sort((a, b) => seenArtists.has(normalizeArtistName(a.artist)) - seenArtists.has(normalizeArtistName(b.artist)));
+      fresh.slice(0, kind === "producer" ? 3 : 2).forEach((p) =>
+        recs.push({
+          id: `${kind}:${normalizeArtistName(p.artist)}`,
+          name: p.artist,
+          note:
+            kind === "producer"
+              ? `${p.title} was produced by ${credit.name}, who also produced ${listTitles(credit.albums)}.`
+              : `${p.title} came out on ${credit.name}, the label behind ${listTitles(credit.albums)}.`,
+          albums: [["Try", p.title]],
+          reasons: credit.albums.map((a) => a.title),
+          source: kind,
+        })
+      );
+    }
+  }
+  return recs;
+}
+
+// ---------- Fill in producers & labels for albums already in the library ----------
+let creditsFillRun = null; // { cancelled } while running
+
+function albumsMissingCredits() {
+  return library.filter((a) => !a.creditsChecked && !creditNames(a.producers).length && !creditNames(a.labels).length);
+}
+
+function renderCreditsBanner(message) {
+  if (creditsFillRun) return; // the progress view owns the banner while running
+  const missing = albumsMissingCredits();
+  if (!missing.length && !message) {
+    creditsBannerEl.hidden = true;
+    return;
+  }
+  creditsBannerEl.hidden = false;
+  if (!missing.length) {
+    creditsBannerEl.innerHTML = `<span class="grow">${escapeHtml(message)}</span>`;
+    return;
+  }
+  const minutes = Math.max(1, Math.round((missing.length * 3.5) / 60));
+  creditsBannerEl.innerHTML = `
+    <span class="grow">${message ? escapeHtml(message) + "<br>" : ""}<strong>${missing.length} album${
+      missing.length === 1 ? "" : "s"
+    }</strong> don't have producers &amp; labels yet. Fill them in for producer and label picks here, and links on the Explore map. Takes about ${minutes} minute${
+      minutes === 1 ? "" : "s"
+    } (MusicBrainz only allows one lookup a second). You can keep using the app meanwhile.</span>
+    <button type="button" id="fillCreditsBtn" class="primary-btn">Fill them in</button>`;
+  document.getElementById("fillCreditsBtn").addEventListener("click", runCreditsFill);
+}
+
+async function runCreditsFill() {
+  const run = { cancelled: false };
+  creditsFillRun = run;
+  const todo = albumsMissingCredits();
+  let found = 0;
+  let genresAdded = 0;
+  let failuresInARow = 0;
+  let stoppedForNetwork = false;
+  creditsBannerEl.hidden = false;
+
+  for (let i = 0; i < todo.length && !run.cancelled; i++) {
+    const album = todo[i];
+    creditsBannerEl.innerHTML = `
+      <span class="grow">Looking up ${i + 1} of ${todo.length}: ${escapeHtml(album.artist)} – ${escapeHtml(album.title)}
+        <div class="credits-progress"><div style="width:${(i / todo.length) * 100}%"></div></div></span>
+      <button type="button" id="stopCreditsBtn">Stop</button>`;
+    document.getElementById("stopCreditsBtn").addEventListener("click", () => (run.cancelled = true));
+    try {
+      let rgId = album.mbReleaseGroupId;
+      let tags = null;
+      if (!rgId) {
+        const rg = await findMbReleaseGroup(album.artist, album.title);
+        if (rg) {
+          rgId = rg.id;
+          tags = rg.tags;
+        }
+      }
+      const credits = rgId ? await fetchMbCredits(rgId) : { producers: [], labels: [] };
+      failuresInARow = 0;
+      // Re-find it: it may have been edited or deleted while we waited.
+      const live = library.find((a) => a.id === album.id);
+      if (!live) continue;
+      if (rgId) live.mbReleaseGroupId = rgId;
+      if (!creditNames(live.producers).length) live.producers = credits.producers;
+      if (!creditNames(live.labels).length) live.labels = credits.labels;
+      if (credits.producers.length || credits.labels.length) found++;
+      if (!(live.genres || []).length && tags) {
+        const genres = splitTags(mbTagsToGenre(tags));
+        if (genres.length) {
+          live.genres = genres;
+          live.genre = genres.join(", ");
+          genresAdded++;
+        }
+      }
+      live.creditsChecked = new Date().toISOString();
+      saveLibrary();
+    } catch (err) {
+      console.error(err);
+      if (++failuresInARow >= 3) {
+        stoppedForNetwork = true;
+        break;
+      }
+    }
+  }
+
+  creditsFillRun = null;
+  renderTagFilterOptions();
+  renderLibrary();
+  const left = albumsMissingCredits().length;
+  renderCreditsBanner(
+    stoppedForNetwork
+      ? `Stopped: couldn't reach MusicBrainz. Check your internet connection, then try again.`
+      : `Found producers or labels for ${found} album${found === 1 ? "" : "s"}${
+          genresAdded ? `, and added genres to ${genresAdded}` : ""
+        }.${
+          !run.cancelled && found < todo.length
+            ? " For any MusicBrainz couldn't match, open the album and type them in, or use “Look up producers & labels”."
+            : ""
+        }${run.cancelled && left ? " Stopped early." : ""}`
+  );
+  if (!forYouModal.hidden) openForYouModal();
 }
 
 function renderRecommendationCards(recs, statusNote) {
@@ -2378,18 +2917,32 @@ function renderRecommendationCards(recs, statusNote) {
     return;
   }
 
+  // Producer/label picks get their own section first, so they aren't buried
+  // under the (often longer) influence-map list.
+  const isCreditRec = (r) => (r.sources || []).some((s) => s === "producer" || s === "label");
+  const creditCards = recs.filter(isCreditRec);
+  const otherCards = recs.filter((r) => !isCreditRec(r)).slice(0, 25);
+  const section = (title, list) => (list.length ? `<h3>${title}</h3>${cardsHtml(list)}` : "");
   forYouBody.innerHTML =
     noteHtml +
-    `<div class="rec-list">${recs
-      .slice(0, 25)
+    section("Same producer or label as albums you love", creditCards) +
+    section(creditCards.length ? "Connected to artists you love" : "", otherCards);
+  forYouBody.querySelectorAll("h3:empty").forEach((h) => h.remove());
+
+  bindRecAddButtons();
+}
+
+const REC_SOURCE_NAMES = { map: "Influence Map", lastfm: "Last.fm", producer: "Producer", label: "Label" };
+
+function cardsHtml(recs) {
+  return `<div class="rec-list">${recs
       .map((r) => {
         const topAlbum = r.albums[0];
         const reasonNames = r.reasons.slice(0, 2).join(", ");
         const extra = r.reasons.length > 2 ? ` +${r.reasons.length - 2} more` : "";
-        const sourceList = r.sources || [r.source === "lastfm" ? "lastfm" : "map"];
-        const sourceTag = sourceList
-          .map((s) => (s === "lastfm" ? "Last.fm" : "Influence Map"))
-          .join(" + ");
+        const sourceList = r.sources || [r.source || "map"];
+        const sourceTag = sourceList.map((s) => REC_SOURCE_NAMES[s] || s).join(" + ");
+        const extraNotes = (r.extraNotes || []).map((n) => `<p class="rec-note">${escapeHtml(n)}</p>`).join("");
         return `
           <div class="rec-card">
             <div class="rec-header">
@@ -2397,6 +2950,7 @@ function renderRecommendationCards(recs, statusNote) {
               <span class="rec-reason">Because you liked ${escapeHtml(reasonNames)}${escapeHtml(extra)}</span>
             </div>
             <p class="rec-note"><span class="candidate-source" style="margin-right:6px;">${sourceTag}</span>${escapeHtml(r.note)}</p>
+            ${extraNotes}
             <div class="rec-footer">
               <span class="rec-album">${
                 topAlbum
@@ -2411,7 +2965,9 @@ function renderRecommendationCards(recs, statusNote) {
         `;
       })
       .join("")}</div>`;
+}
 
+function bindRecAddButtons() {
   forYouBody.querySelectorAll(".rec-add-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       forYouModal.hidden = true;
@@ -2433,19 +2989,55 @@ async function openForYouModal() {
 
   const mapRecs = computeRecommendations();
   const hasLastfmKey = !!getLastfmKey();
+  const hasCredits = likedCredits("producers").length > 0 || likedCredits("labels").length > 0;
+  const state = { lastfm: [], credit: [], lastfmNote: "", creditNote: "" };
+  const draw = () => {
+    if (forYouModal.hidden) return;
+    renderRecommendationCards(
+      mergeRecommendations(mapRecs, state.lastfm, state.credit),
+      [state.creditNote, state.lastfmNote].filter(Boolean).join(" ")
+    );
+  };
 
-  renderRecommendationCards(mergeRecommendations(mapRecs, []), hasLastfmKey ? "Checking Last.fm for more recommendations..." : "");
+  state.creditNote = hasCredits ? "Checking the producers & labels behind albums you love..." : "";
+  state.lastfmNote = hasLastfmKey ? "Checking Last.fm for more recommendations..." : "";
   forYouModal.hidden = false;
+  renderCreditsBanner();
+  draw();
 
-  if (!hasLastfmKey) return;
-
-  try {
-    const { recs: lastfmRecs, note } = await computeLastfmRecommendations();
-    renderRecommendationCards(mergeRecommendations(mapRecs, lastfmRecs), note);
-  } catch (err) {
-    console.error(err);
-    renderRecommendationCards(mergeRecommendations(mapRecs, []), "Couldn't reach Last.fm — check your API key or connection.");
+  const jobs = [];
+  if (hasCredits) {
+    jobs.push(
+      computeCreditRecommendations((msg) => {
+        state.creditNote = msg;
+        draw();
+      })
+        .then((recs) => {
+          state.credit = recs;
+          state.creditNote = recs.length ? "" : "No new producer or label picks right now (you may already have their best-known albums).";
+        })
+        .catch((err) => {
+          console.error(err);
+          state.creditNote = "Couldn't reach MusicBrainz for producer & label picks.";
+        })
+        .then(draw)
+    );
   }
+  if (hasLastfmKey) {
+    jobs.push(
+      computeLastfmRecommendations()
+        .then(({ recs, note }) => {
+          state.lastfm = recs;
+          state.lastfmNote = note || "";
+        })
+        .catch((err) => {
+          console.error(err);
+          state.lastfmNote = "Couldn't reach Last.fm — check your API key or connection.";
+        })
+        .then(draw)
+    );
+  }
+  await Promise.all(jobs);
 }
 
 document.getElementById("forYouBtn").addEventListener("click", openForYouModal);

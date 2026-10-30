@@ -44,8 +44,8 @@ explore = sub_once(r'<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.
                    "<script>" + js_safe(read("vendor/d3.min.js")) + "</script>", explore)
 explore = sub_once(r'<script src="influence-data.js"></script>',
                    "<script>window.INFLUENCE_DATA = parent.INFLUENCE_DATA;</script>", explore)
-explore = sub_once(r'var lib=JSON.parse\(localStorage.getItem\("albumTracker.library.v1"\)\|\|"\[\]"\);',
-                   "var lib=(parent.__albumTrackerLibrary&&parent.__albumTrackerLibrary())||[];", explore)
+explore = sub_once(r'lib=JSON.parse\(localStorage.getItem\("albumTracker.library.v1"\)\|\|"\[\]"\);',
+                   "lib=(parent.__albumTrackerLibrary&&parent.__albumTrackerLibrary())||[];", explore)
 explore = explore.replace("</body>", """<script>
 // Links back to the tracker (and "+ Add to library") close the map instead of navigating.
 document.addEventListener("click", function (e) {

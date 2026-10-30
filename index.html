@@ -24,6 +24,13 @@
   .chip-input{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:6px;border:1px solid var(--border,#33364a);border-radius:8px;background:var(--surface-2,#262837);margin-top:4px;}
   .chip-input input{flex:1;min-width:140px;border:none !important;background:transparent !important;outline:none;padding:4px !important;margin:0 !important;box-shadow:none !important;}
   .chip{display:inline-flex;align-items:center;gap:4px;font-size:12px;padding:3px 8px;border-radius:999px;background:rgba(124,156,255,.18);color:#c8d4ff;border:1px solid rgba(124,156,255,.4);}
+  .chip.producer{background:rgba(180,140,255,.16);color:#d9c8ff;border-color:rgba(180,140,255,.45);}
+  .chip.label{background:rgba(79,195,161,.14);color:#a9e8d5;border-color:rgba(79,195,161,.45);}
+  .credits-banner{margin:0 0 16px;padding:10px 14px;border-radius:10px;background:rgba(180,140,255,.1);border:1px solid rgba(180,140,255,.35);font-size:13.5px;display:flex;flex-wrap:wrap;align-items:center;gap:10px;}
+  .credits-banner .grow{flex:1;min-width:220px;}
+  .credits-progress{height:6px;background:var(--surface-2,#262837);border-radius:3px;overflow:hidden;width:100%;}
+  .credits-progress > div{height:100%;background:#b48cff;width:0;transition:width .3s;}
+  #lookupCreditsBtn{margin:0 0 4px;}
   .chip.genre{background:rgba(46,204,113,.14);color:#a8ecc4;border-color:rgba(46,204,113,.4);}
   .chip button{all:unset;cursor:pointer;opacity:.7;font-size:12px;padding:0 2px;}
   .chip button:hover{opacity:1;}
@@ -68,7 +75,7 @@
       <button id="manageFoldersBtn" title="Create, rename, or delete folders">📁 Folders</button>
       <button id="selectModeBtn" title="Select multiple albums for bulk actions">☑ Select</button>
       <select id="tagFilter" title="Filter by genre or tag">
-        <option value="">All genres &amp; tags</option>
+        <option value="">All genres, tags &amp; credits</option>
       </select>
       <select id="sortSelect">
         <option value="dateAdded-desc">Newest added</option>
@@ -153,6 +160,20 @@
             </div>
             <datalist id="tagSuggestions"></datalist>
           </label>
+          <label for="producerInput">Producers
+            <div class="chip-input" id="producerChips">
+              <input id="producerInput" type="text" placeholder="Filled in from search, or type one" list="producerSuggestions">
+            </div>
+            <datalist id="producerSuggestions"></datalist>
+          </label>
+          <label for="labelInput">Record labels
+            <div class="chip-input" id="labelChips">
+              <input id="labelInput" type="text" placeholder="Filled in from search, or type one" list="labelSuggestions">
+            </div>
+            <datalist id="labelSuggestions"></datalist>
+          </label>
+          <button id="lookupCreditsBtn" type="button">🎛 Look up producers &amp; labels</button>
+          <p id="creditsStatus" class="status-text"></p>
           <label for="folderCheckboxList">Folders
             <div id="folderCheckboxList" class="folder-checkbox-list"></div>
           </label>
@@ -261,6 +282,7 @@
         <p class="hint" style="margin:0;">Based on artists you rated 4★ or higher. A curated influence map runs for free; adding a Last.fm key layers on a second opinion for every rated artist — when both agree you get one combined card, when they don't you get both picks.</p>
         <button id="lastfmSettingsBtn" type="button">⚙ Last.fm Key</button>
       </div>
+      <div id="creditsBanner" class="credits-banner" hidden></div>
       <div id="forYouBody" class="stats-body"></div>
     </div>
   </div>

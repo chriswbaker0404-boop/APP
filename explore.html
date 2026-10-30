@@ -67,6 +67,13 @@
   .section2{border-top:1.5px solid var(--border);margin-top:46px;padding-top:22px;}
   .h2{font-weight:700;letter-spacing:.01em;font-size:clamp(24px,4vw,40px);line-height:1.05;margin:0;color:var(--ink);}
   .nm-pole{font-weight:700;fill:var(--text-secondary);text-anchor:middle;pointer-events:none;letter-spacing:.02em;}
+  .tgl{font-size:12.5px;color:var(--text-secondary);display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;}
+  .tgl input{accent-color:var(--text-accent);margin:0;}
+  .tgl .sw{width:16px;height:0;border-top:2px dashed;display:inline-block;}
+  .tgl.off{opacity:.45;cursor:default;}
+  .cmeta{color:var(--text-secondary);font-size:12.5px;}
+  .lnk-static{font-size:13px;padding:3px 10px;border-radius:999px;background:transparent;border:1px dashed var(--border);color:var(--text-secondary);}
+  .credit-line{pointer-events:visibleStroke;}
   footer{margin-top:28px;font-size:12.5px;color:var(--text-muted);line-height:1.6;border-top:1px solid var(--border);padding-top:16px;max-width:80ch;}
 </style>
 </head>
@@ -82,6 +89,8 @@
     <input id="search" class="search" type="text" placeholder="Search bands…" autocomplete="off" spellcheck="false">
     <span class="hint">Tap a dot · drag to pan · scroll to zoom · ringed = recent underground · gold halo = introduced a new sound</span>
     <button class="btn" id="reset">Reset view</button>
+    <label class="tgl" id="credPWrap"><input type="checkbox" id="credP"><span class="sw" style="border-color:#b48cff"></span>Shared producers</label>
+    <label class="tgl" id="credLWrap"><input type="checkbox" id="credL"><span class="sw" style="border-color:#4fc3a1"></span>Shared labels</label>
   </div>
   <div class="mapbox" id="map"></div>
   <div class="panel" id="panel"></div>
@@ -89,7 +98,7 @@
     <p class="eyebrow">A second view · sound over chronology</p>
     <h2 class="h2">Arranged by style</h2>
     <p class="sub">The same bands, positioned by sound alone with year ignored. Every anchor here is a movement, not just a broad family - metal splits into heavy metal, thrash, death and black, nu / alt-metal, and metalcore, punk into punk, hardcore, post-hardcore, and pop-punk, and so on. Dot colors group the movements back into their parent families, a band sits at its movement, and a genre-blender drifts toward a second one.</p>
-    <div class="controls"><input id="search2" class="search" type="text" placeholder="Search bands…" autocomplete="off" spellcheck="false"><span class="hint">Tap a dot to trace its lineage · drag to pan · scroll to zoom</span><button class="btn" id="reset2">Reset view</button></div>
+    <div class="controls"><input id="search2" class="search" type="text" placeholder="Search bands…" autocomplete="off" spellcheck="false"><span class="hint">Tap a dot to trace its lineage · drag to pan · scroll to zoom</span><button class="btn" id="reset2">Reset view</button><label class="tgl" id="credP2Wrap"><input type="checkbox" id="credP2"><span class="sw" style="border-color:#b48cff"></span>Shared producers</label><label class="tgl" id="credL2Wrap"><input type="checkbox" id="credL2"><span class="sw" style="border-color:#4fc3a1"></span>Shared labels</label></div>
     <div class="mapbox" id="map2"></div>
     <div class="panel" id="panel2"></div>
   </section>
@@ -182,13 +191,107 @@
     discharge:"D-beat — the relentless hardcore rhythm that spread worldwide."
   };
   var loggedNames={};
+  var lib=[];
   try{
-    var lib=JSON.parse(localStorage.getItem("albumTracker.library.v1")||"[]");
+    lib=JSON.parse(localStorage.getItem("albumTracker.library.v1")||"[]");
     lib.forEach(function(a){ if(a.artist) loggedNames[a.artist.trim().toLowerCase()]=true; });
   }catch(e){}
+
+  // ---- Producers & labels from your library ----
+  function escH(t){return String(t==null?"":t).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+  function creditNames(list){return (list||[]).map(function(c){return typeof c==="string"?c:(c&&c.name)||"";}).filter(Boolean);}
+  var libAlbums={};      // artist (lowercase) -> your albums by them
+  var creditArtists={};  // "producer:steve albini" -> {name, kind, artists:{lowercase: display name}}
+  lib.forEach(function(a){
+    if(!a.artist) return;
+    var art=a.artist.trim(), k=art.toLowerCase();
+    (libAlbums[k]=libAlbums[k]||[]).push(a);
+    [["producer",a.producers],["label",a.labels]].forEach(function(pair){
+      creditNames(pair[1]).forEach(function(n){
+        var key=pair[0]+":"+n.toLowerCase();
+        var e=creditArtists[key]||(creditArtists[key]={name:n,kind:pair[0],artists:{}});
+        e.artists[k]=art;
+      });
+    });
+  });
+  // Other artists in your library sharing a producer or label with this one.
+  function sharedCredits(artistLower){
+    var out={};
+    for(var key in creditArtists){
+      var e=creditArtists[key]; if(!e.artists[artistLower]) continue;
+      for(var other in e.artists){
+        if(other===artistLower) continue;
+        (out[other]||(out[other]={artist:e.artists[other],lower:other,via:[]})).via.push(e);
+      }
+    }
+    return Object.keys(out).map(function(k){return out[k];}).sort(function(a,b){return b.via.length-a.via.length||a.artist.localeCompare(b.artist);});
+  }
+  function viaText(via){return via.map(function(v){return v.name+(v.kind==="label"?" (label)":" (producer)");}).join(", ");}
   var nodes=[],byId={},desc={};
   for(var id in RAW){var r=RAW[id];var o={id:id,name:r[0],year:r[1],g:r[2],note:r[3],by:r[4],u:!!r[5],alb:r[6]||[],fig:r[7]||"",inn:INN[id]||"",logged:!!loggedNames[r[0].trim().toLowerCase()]};nodes.push(o);byId[id]=o;desc[id]=[];}
   nodes.forEach(function(n){n.by.forEach(function(p){if(desc[p])desc[p].push(n.id);});});
+  var nameToId={}; nodes.forEach(function(n){nameToId[n.name.trim().toLowerCase()]=n.id;});
+
+  // Panel section: your albums by this artist (with producers + labels), and
+  // which other artists in your library share a producer or label with them.
+  function creditHtml(id){
+    var a=byId[id], k=a.name.trim().toLowerCase(), albums=libAlbums[k]||[];
+    if(!albums.length) return "";
+    var rows=albums.map(function(al){
+      var p=creditNames(al.producers), l=creditNames(al.labels), meta=[];
+      if(p.length) meta.push("produced by "+escH(p.slice(0,3).join(", ")));
+      if(l.length) meta.push(escH(l.slice(0,2).join(", ")));
+      return '<div class="arow"><span class="atag">Your album</span><span class="atitle">'+escH(al.title)+(meta.length?' <span class="cmeta">· '+meta.join(" · ")+'</span>':'')+'</span></div>';
+    }).join("");
+    var shared=sharedCredits(k), sh="";
+    if(shared.length){
+      sh='<div class="albs"><h4>Shares a producer or label with</h4><div class="links">'+shared.slice(0,30).map(function(x){
+        var nid=nameToId[x.lower], txt=escH(x.artist)+' <span class="cmeta">· '+escH(viaText(x.via))+'</span>';
+        return nid?'<span class="lnk" data-id="'+nid+'">'+txt+'</span>':'<span class="lnk-static" title="Not on this map">'+txt+'</span>';
+      }).join("")+'</div></div>';
+    }
+    var hasCredits=albums.some(function(al){return creditNames(al.producers).length||creditNames(al.labels).length;});
+    var hint=hasCredits?"":'<p class="empty" style="margin:6px 0 0">No producers or labels yet. In the tracker, open For You and click “Fill them in”.</p>';
+    return '<div class="albs"><h4>In your library</h4>'+rows+hint+'</div>'+sh;
+  }
+
+  // Pairs of map artists from your library that share a producer or label.
+  function creditPairs(lookup){
+    var pairs={};
+    for(var key in creditArtists){
+      var e=creditArtists[key], ids=Object.keys(e.artists).map(function(k){return nameToId[k];}).filter(function(x){return x&&lookup[x];});
+      for(var i=0;i<ids.length;i++) for(var j=i+1;j<ids.length;j++){
+        var pk=ids[i]<ids[j]?ids[i]+"|"+ids[j]:ids[j]+"|"+ids[i];
+        var pr=pairs[pk]||(pairs[pk]={a:lookup[ids[i]],b:lookup[ids[j]],producer:[],label:[]});
+        pr[e.kind].push(e.name);
+      }
+    }
+    var out=[];
+    for(var pk2 in pairs){
+      var pr2=pairs[pk2];
+      if(pr2.producer.length) out.push({a:pr2.a,b:pr2.b,kind:"producer",names:pr2.producer});
+      if(pr2.label.length) out.push({a:pr2.a,b:pr2.b,kind:"label",names:pr2.label});
+    }
+    return out;
+  }
+  var CREDIT_COLOR={producer:"#b48cff",label:"#4fc3a1"};
+  function drawCreditLines(group, pairs){
+    var sel=group.selectAll("line").data(pairs).enter().append("line").attr("class","credit-line")
+      .attr("stroke",function(d){return CREDIT_COLOR[d.kind];}).attr("stroke-width",1.8).attr("stroke-dasharray","5 4")
+      .attr("stroke-opacity",0.85).style("display","none");
+    sel.append("title").text(function(d){return (d.kind==="producer"?"Shared producer: ":"Shared label: ")+d.names.join(", ");});
+    return sel;
+  }
+  function placeLines(sel){sel.attr("x1",function(d){return d.a.x;}).attr("y1",function(d){return d.a.y;}).attr("x2",function(d){return d.b.x;}).attr("y2",function(d){return d.b.y;});}
+  function wireToggles(pId,lId,sel,pairs){
+    [[pId,"producer"],[lId,"label"]].forEach(function(t){
+      var box=document.getElementById(t[0]), wrap=document.getElementById(t[0]+"Wrap");
+      var n=pairs.filter(function(d){return d.kind===t[1];}).length;
+      if(!n){box.disabled=true;wrap.className="tgl off";wrap.title="None yet. Producers & labels come from your library (For You → Fill them in).";return;}
+      wrap.title=n+" link"+(n===1?"":"s")+" between artists in your library";
+      box.addEventListener("change",function(){sel.filter(function(d){return d.kind===t[1];}).style("display",box.checked?null:"none");});
+    });
+  }
   var links=[]; nodes.forEach(function(n){n.by.forEach(function(p){if(byId[p])links.push({source:p,target:n.id});});});
   var ug=nodes.filter(function(n){return n.u;});
 
@@ -214,6 +317,7 @@
     gGrid.append("text").attr("class","nm-dec").attr("x",xs(yr)).attr("y",42).text(yr===1950?"1950":yr===2000?"2000":("'"+(""+yr).slice(2)));
   }
   var gLink=root.append("g").attr("stroke-linecap","round");
+  var gCred=root.append("g");
   var gNode=root.append("g");
   var gConn=root.append("g").style("pointer-events","none");
   var gLabel=root.append("g");
@@ -248,8 +352,13 @@
     ring.attr("cx",function(d){return d.x;}).attr("cy",function(d){return d.y;});
     innr.attr("cx",function(d){return d.x;}).attr("cy",function(d){return d.y;});
     label.attr("x",function(d){return d.x;}).attr("y",function(d){return d.y;});
+    if(credLines) placeLines(credLines);
     gConn.selectAll("line").attr("x1",function(d){return d.a.x;}).attr("y1",function(d){return d.a.y;}).attr("x2",function(d){return d.b.x;}).attr("y2",function(d){return d.b.y;});
   }
+
+  var credPairs1=creditPairs(byId);
+  var credLines=drawCreditLines(gCred,credPairs1);
+  wireToggles("credP","credL",credLines,credPairs1);
 
   var sticky=null;
   function paint(id){
@@ -302,6 +411,7 @@
       innHtml+
       figHtml+
       albHtml+
+      creditHtml(id)+
       '<div class="cols">'+
         '<div class="col"><h4><span class="cbar" style="background:#1D9E75"></span>Shaped by</h4><div class="links">'+mk(a.by)+'</div></div>'+
         '<div class="col"><h4><span class="cbar" style="background:#BA7517"></span>Went on to shape</h4><div class="links">'+mk(desc[id])+'</div></div>'+
@@ -428,6 +538,7 @@
   var gPole=root2.append("g");
   GEN.forEach(function(){});
   MOVES.forEach(function(m){gPole.append("text").attr("class","nm-pole").attr("x",m.x).attr("y",m.y).attr("font-size",16).attr("opacity",0.3).style("fill",GC[m.fam]).text(m.label);});
+  var gCred2=root2.append("g");
   var gNode2=root2.append("g"), gConn2=root2.append("g").style("pointer-events","none"), gLabel2=root2.append("g");
   var node2=gNode2.selectAll("circle.dot").data(n2).enter().append("circle").attr("class","nm-node dot").attr("r",function(d){return d.hub?6:4.2;}).attr("fill",function(d){return GC[MF[d.mv]];}).style("stroke",function(d){return d.logged?"#2ecc71":"var(--surface-1)";}).attr("stroke-width",function(d){return d.logged?2.5:1.2;})
     .on("click",function(ev,d){ev.stopPropagation();sticky2=d.id;paint2(d.id);panel2(d.id);})
@@ -442,8 +553,12 @@
     innr2.attr("cx",function(d){return d.x;}).attr("cy",function(d){return d.y;});
     ring2.attr("cx",function(d){return d.x;}).attr("cy",function(d){return d.y;});
     label2.attr("x",function(d){return d.x;}).attr("y",function(d){return d.y;});
+    if(credLines2) placeLines(credLines2);
     gConn2.selectAll("line").attr("x1",function(d){return d.a.x;}).attr("y1",function(d){return d.a.y;}).attr("x2",function(d){return d.b.x;}).attr("y2",function(d){return d.b.y;});
   }
+  var credPairs2=creditPairs(b2);
+  var credLines2=drawCreditLines(gCred2,credPairs2);
+  wireToggles("credP2","credL2",credLines2,credPairs2);
   var sticky2=null;
   function paint2(id){
     if(!id){node2.attr("opacity",1).style("stroke","var(--surface-1)").attr("stroke-width",1.2);innr2.attr("opacity",0.85);ring2.attr("opacity",0.6);label2.style("display",function(d){return d.hub?"block":"none";});gConn2.selectAll("line").remove();return;}
@@ -469,7 +584,7 @@
     var libStatus2=a.logged
       ? '<span style="font-size:11px;color:#2ecc71;letter-spacing:.04em;">&#10003; IN YOUR LIBRARY</span>'
       : '<a href="index.html?addArtist='+encodeURIComponent(a.name)+'" style="font-size:11px;color:var(--text-accent);letter-spacing:.04em;text-decoration:none;">+ ADD TO LIBRARY</a>';
-    document.getElementById("panel2").innerHTML='<p class="pname">'+a.name+'</p><p class="pmeta"><span class="dot" style="background:'+GC[MF[b2[id].mv]]+'"></span>'+MLAB[b2[id].mv]+blk+' &nbsp;·&nbsp; '+libStatus2+'</p><p class="pnote">'+a.note+'</p>'+innH+figH+albH+'<div class="cols"><div class="col"><h4><span class="cbar" style="background:#1D9E75"></span>Shaped by</h4><div class="links">'+mk(a.by)+'</div></div><div class="col"><h4><span class="cbar" style="background:#BA7517"></span>Went on to shape</h4><div class="links">'+mk(desc[id])+'</div></div></div>';
+    document.getElementById("panel2").innerHTML='<p class="pname">'+a.name+'</p><p class="pmeta"><span class="dot" style="background:'+GC[MF[b2[id].mv]]+'"></span>'+MLAB[b2[id].mv]+blk+' &nbsp;·&nbsp; '+libStatus2+'</p><p class="pnote">'+a.note+'</p>'+innH+figH+albH+creditHtml(id)+'<div class="cols"><div class="col"><h4><span class="cbar" style="background:#1D9E75"></span>Shaped by</h4><div class="links">'+mk(a.by)+'</div></div><div class="col"><h4><span class="cbar" style="background:#BA7517"></span>Went on to shape</h4><div class="links">'+mk(desc[id])+'</div></div></div>';
     document.querySelectorAll('#panel2 .lnk').forEach(function(el){el.addEventListener('click',function(){var x=el.getAttribute('data-id');sticky2=x;paint2(x);panel2(x);});});
   }
   var zoom2=d3.zoom().scaleExtent([0.6,6]).on("zoom",function(ev){root2.attr("transform",ev.transform);});
